@@ -1,0 +1,140 @@
+# Python / virtual environments
+.venv/
+venv/
+env/
+ENV/
+*.venv/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+config.local.*
+
+# Logs and diagnostics
+*.log
+logs/
+crash dumps/
+core.*
+
+# GPU / CUDA / ML generated artifacts
+cuda_*_log*
+cuda_crash_logs/
+*.cubin
+*.ptx
+*.fatbin
+*.nvcc
+*.bin
+*.tfevents*
+*.events/
+wandb/
+mlruns/
+checkpoints/
+.ckpt/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Training / inference output folders
+runs/
+out/
+outcomes/
+results/
+artifacts/
+cache/
+
+# Common dataset / model cache files
+*.npy
+*.npz
+*.parquet
+*.arrow
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Temporary and local scratch files
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# Optional: keep project model files tracked if they are required assets
+# Uncomment only if you do not want to track ONNX/weights in git
+# *.onnx
+# *.weights
+# *.bin
+
+
+# Picmatch project data
+data/
+group_photos/
+single_person/
+orientation_backup/
+out/
+
+# Picmatch models / model binaries
+models/
+*.onnx
+
+# Generated reports and result files
+*.xlsx
+*.csv
+embeddings_cache.json
+gallery_index.json
+
+# Local project archives
+*.zip
+
+# Local backup copies
+*_backup.py
+
+# Picmatch-specific data
+data/
+group_photos/
+single_person/
+orientation_backup/
+out/
+
+# Models and model binaries
+models/
+*.onnx
+
+# Generated reports/results
+*.xlsx
+*.csv
+embeddings_cache.json
+gallery_index.json
+
+# Archives
+*.zip
+
+# Local backup files
+*_backup.py
+
+# Secondary / old project copy
+picmatch/
+
+# Nested virtual environment
+.ven/

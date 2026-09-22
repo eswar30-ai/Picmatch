@@ -1,0 +1,28 @@
+# PicMatch - GPU pipeline (SCRFD-10GF detection + ArcFace w600k_r50).
+#
+#   venv\Scripts\python -m pip install -r requirements.txt
+#   venv\Scripts\python fetch_models.py        # downloads models/*.onnx
+#   venv\Scripts\python app.py
+
+Flask>=3.0
+numpy>=1.24,<2.3
+opencv-contrib-python>=4.5
+Pillow>=10.0
+requests>=2.0
+
+onnxruntime-gpu>=1.20        # CUDA 12.x + cuDNN 9.x build
+
+# CUDA/cuDNN runtime as wheels, so no system CUDA toolkit install is needed.
+# cuda_dlls.py puts these on the Windows loader path at import time.
+nvidia-cudnn-cu12
+nvidia-cublas-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cusparse-cu12
+nvidia-cusolver-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+
+# used by SFA.py (duplicate-report spreadsheets), not by the matcher
+pandas>=2.0
+openpyxl>=3.1
