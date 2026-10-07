@@ -98,11 +98,15 @@ class FaceIndex:
         quals = np.array([[r["quality"]["det_score"], r["quality"]["size"],
                            r["quality"]["blur"], r["quality"]["pose"]] for r in rows],
                          np.float32) if rows else np.zeros((0, 4), np.float32)
-        np.savez_compressed(self.npz_path, embeddings=embeds,
+        tmp_npz = os.path.join(self.data_dir, "index_tmp.npz")
+        tmp_json = os.path.join(self.data_dir, "index_tmp.json")
+        np.savez_compressed(tmp_npz, embeddings=embeds,
                             bboxes=bboxes, quality=quals)
-        with open(self.json_path, "w", encoding="utf-8") as fh:
+        with open(tmp_json, "w", encoding="utf-8") as fh:
             json.dump({"folder": self.folder, "params": self.params,
                        "photos": names, "counts": counts, "stamps": self.stamps}, fh)
+        os.replace(tmp_npz, self.npz_path)
+        os.replace(tmp_json, self.json_path)
 
     # ------------------------------------------------------------------ build
     def build(self, folder, engine, workers=4, progress=True, force=False):

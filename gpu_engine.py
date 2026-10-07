@@ -57,12 +57,19 @@ def available_providers(force_cpu=False):
     have = set(ort.get_available_providers())
     order = []
     if "CUDAExecutionProvider" in have:
-        order.append(("CUDAExecutionProvider", {
+        cuda_opts = {
             "device_id": 0,
             "arena_extend_strategy": "kSameAsRequested",
             "cudnn_conv_algo_search": "HEURISTIC",
             "do_copy_in_default_stream": True,
-        }))
+        }
+        mem_limit = os.environ.get("PMG_GPU_MEM_LIMIT") or os.environ.get("PICMATCH_GPU_MEM_LIMIT")
+        if mem_limit:
+            try:
+                cuda_opts["gpu_mem_limit"] = int(mem_limit)
+            except ValueError:
+                pass
+        order.append(("CUDAExecutionProvider", cuda_opts))
     if "TensorrtExecutionProvider" in have and os.environ.get("PMG_TRT") == "1":
         order.insert(0, "TensorrtExecutionProvider")
     order.append("CPUExecutionProvider")
@@ -87,11 +94,12 @@ def _make_session(path, providers):
 
 
 # ------------------------------------------------------------------- images
-def load_image(source):
+def load_image(source, max_dim=2560):
     """Path or bytes -> BGR uint8 array, EXIF orientation applied.
 
     Goes through PIL because cv2.imread silently returns None for non-ASCII
-    Windows paths and ignores the EXIF orientation flag.
+    Windows paths and ignores the EXIF orientation flag. Caps maximum dimension
+    to avoid massive memory spikes from raw camera photos.
     """
     try:
         if isinstance(source, (bytes, bytearray)):
@@ -100,13 +108,23 @@ def load_image(source):
             with open(source, "rb") as fh:
                 pil = Image.open(io.BytesIO(fh.read()))
         pil = ImageOps.exif_transpose(pil).convert("RGB")
+        w, h = pil.size
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            new_w, new_h = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
+            pil = pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
         return np.asarray(pil)[:, :, ::-1].copy()
     except Exception:
         try:
             raw = (np.frombuffer(bytes(source), np.uint8)
                    if isinstance(source, (bytes, bytearray))
                    else np.fromfile(source, np.uint8))
-            return cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if img is not None and max(img.shape[:2]) > max_dim:
+                scale = max_dim / max(img.shape[:2])
+                new_w, new_h = max(32, int(round(img.shape[1] * scale))), max(32, int(round(img.shape[0] * scale)))
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            return img
         except Exception:
             return None
 
@@ -302,23 +320,28 @@ class ArcFace:
     def provider(self):
         return self.session.get_providers()[0]
 
-    def embed_batch(self, crops, flip=True):
+    def embed_batch(self, crops, flip=True, max_chunk=32):
         """crops: list of aligned BGR 112x112 images -> (N,512) unit vectors.
 
         Each face is embedded twice - as-is and mirrored - and the two are
-        summed. That averages out a little of the left/right pose bias and is
-        essentially free on GPU.
+        summed. Processed in sub-batches to cap peak VRAM allocation.
         """
         if not len(crops):
             return np.zeros((0, 512), np.float32)
         batch = list(crops)
         if flip:
             batch += [cv2.flip(c, 1) for c in crops]
-        blob = cv2.dnn.blobFromImages(
-            batch, 1.0 / 127.5, (self.size, self.size),
-            (127.5, 127.5, 127.5), swapRB=True)
-        feats = self.session.run(self.output_names, {self.input_name: blob})[0]
-        feats = np.asarray(feats, np.float32)
+
+        feats_chunks = []
+        for i in range(0, len(batch), max_chunk):
+            sub = batch[i:i + max_chunk]
+            blob = cv2.dnn.blobFromImages(
+                sub, 1.0 / 127.5, (self.size, self.size),
+                (127.5, 127.5, 127.5), swapRB=True)
+            f = self.session.run(self.output_names, {self.input_name: blob})[0]
+            feats_chunks.append(np.asarray(f, np.float32))
+
+        feats = np.vstack(feats_chunks) if feats_chunks else np.zeros((0, 512), np.float32)
         if flip:
             n = len(crops)
             feats = _l2(feats[:n]) + _l2(feats[n:])
@@ -379,7 +402,7 @@ class FaceEngine:
         # crowd is off the bottom at 640. Running two scales and merging covers
         # close-up portraits and distant faces in the same pass.
         self.det_scales = tuple(det_scales) if det_scales else             tuple(sorted({det_size, 640}, reverse=True))
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def describe(self):
         return (f"{self.detector.provider()} | det_scales={list(self.det_scales)} "
@@ -449,37 +472,39 @@ class FaceEngine:
         of sideways frames with no EXIF flag, and a sideways face is a face the
         detector never sees.
         """
-        stats = {}
-        for degrees, code in self._ROTATIONS:
-            turned = img if code is None else cv2.rotate(img, code)
-            dets, _ = self._detect_multiscale(turned)
-            stats[degrees] = (len(dets),
-                              float(dets[:, 4].mean()) if len(dets) else 0.0)
+        with self._lock:
+            stats = {}
+            for degrees, code in self._ROTATIONS:
+                turned = img if code is None else cv2.rotate(img, code)
+                dets, _ = self._detect_multiscale(turned)
+                stats[degrees] = (len(dets),
+                                  float(dets[:, 4].mean()) if len(dets) else 0.0)
 
-        best_deg, best_n, best_conf = 0, *stats[0]
-        for degrees in (90, 180, 270):
-            n, conf = stats[degrees]
-            if n > best_n or (n == best_n and n and conf > best_conf + _ORIENT_MARGIN):
-                best_deg, best_n, best_conf = degrees, n, conf
-        return best_deg, stats
+            best_deg, best_n, best_conf = 0, *stats[0]
+            for degrees in (90, 180, 270):
+                n, conf = stats[degrees]
+                if n > best_n or (n == best_n and n and conf > best_conf + _ORIENT_MARGIN):
+                    best_deg, best_n, best_conf = degrees, n, conf
+            return best_deg, stats
 
     def detect(self, img, auto_orient=True):
         """Detect faces, rotating the frame if the photo was stored sideways.
 
         Returns (image_used, dets, kps). Always crop from the returned image.
         """
-        dets, kps = (self._detect_tiled(img) if self.tiles
-                     else self._detect_multiscale(img))
-        if len(dets) or not auto_orient:
+        with self._lock:
+            dets, kps = (self._detect_tiled(img) if self.tiles
+                         else self._detect_multiscale(img))
+            if len(dets) or not auto_orient:
+                return img, dets, kps
+            # nothing upright - the frame may be rotated with no EXIF flag
+            for code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE,
+                         cv2.ROTATE_180):
+                turned = cv2.rotate(img, code)
+                d, k = self._detect_multiscale(turned)
+                if len(d):
+                    return turned, d, k
             return img, dets, kps
-        # nothing upright - the frame may be rotated with no EXIF flag
-        for code in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE,
-                     cv2.ROTATE_180):
-            turned = cv2.rotate(img, code)
-            d, k = self._detect_multiscale(turned)
-            if len(d):
-                return turned, d, k
-        return img, dets, kps
 
     def analyze(self, source, auto_orient=True):
         """Path/bytes/array -> list of Face with embeddings. GPU-batched."""

@@ -11,13 +11,16 @@ side-on faces have to clear a stricter line before they are believed.
 """
 
 import argparse
-import ipaddress
-import os
-import json
+import csv
 import io
+import ipaddress
+import json
+import os
 import threading
+import time
 
 import numpy as np
+import requests
 from flask import Flask, request, render_template_string, send_from_directory, jsonify, send_file, abort
 from werkzeug.utils import secure_filename
 from PIL import Image, ImageOps
@@ -30,23 +33,55 @@ from fix_orientation import EXIF_ORIENTATION_TAG, pil_to_bgr, rotate_pil_clockwi
 
 GROUP_PHOTO_FOLDER = os.environ.get("PICMATCH_PHOTOS", "group_photos")
 DATA_DIR = os.environ.get("PICMATCH_DATA", "data")
-GALLERY_INDEX_FILE = "gallery_index.json"
+GALLERY_INDEX_FILE = os.environ.get("PICMATCH_GALLERY_INDEX", "gallery_index.json")
+API_URL = os.environ.get("PICMATCH_GALLERY_API", "https://services.heterohcl.com/dfs-icon/api/gallery?summit_id=1")
+FETCH_INTERVAL_SECONDS = int(os.environ.get("PICMATCH_FETCH_INTERVAL", 15 * 60))
+AUTO_SYNC_GALLERY = os.environ.get("PICMATCH_AUTO_SYNC", "1") != "0"
+SINGLE_PERSON_FOLDER = os.environ.get("PICMATCH_SINGLE_PERSON", "single_person")
 IMAGE_EXTS = ge.IMAGE_EXTS
 # ArcFace cosine scale - nothing to do with the old 0.51 SFace line.
 ACCEPT = float(os.environ.get("PICMATCH_THRESHOLD", matcher.ACCEPT))
 REVIEW = float(os.environ.get("PICMATCH_REVIEW", matcher.REVIEW))
+INDEX_DELAY_SECONDS = float(os.environ.get("PICMATCH_INDEX_DELAY", "0.8"))
 # ========================================================================
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 48 * 1024 * 1024
 
 model_error = None
-group_cache = {}   # photo name -> [face embeddings]; len() == photos indexed
 gallery_index = {}
+gallery_lock = threading.RLock()
 _engine = None
 _index = None
-_engine_lock = threading.Lock()
-_index_lock = threading.Lock()
+_engine_lock = threading.RLock()
+_index_lock = threading.RLock()
+_gallery_thread = None
+_gallery_thread_lock = threading.RLock()
+_gallery_sync_lock = threading.RLock()
+_gallery_sync_in_progress = False
+
+_user_activity_lock = threading.Lock()
+_active_user_requests = 0
+_user_activity_event = threading.Event()
+_user_activity_event.set()
+
+
+class UserGPUContext:
+    """Signals that an interactive user request is using the GPU.
+    Background indexing checks this and yields immediately to avoid GPU crashes and 502s."""
+    def __enter__(self):
+        global _active_user_requests
+        with _user_activity_lock:
+            _active_user_requests += 1
+            _user_activity_event.clear()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _active_user_requests
+        with _user_activity_lock:
+            _active_user_requests = max(0, _active_user_requests - 1)
+            if _active_user_requests == 0:
+                _user_activity_event.set()
 
 
 def engine():
@@ -85,21 +120,25 @@ def face_db():
 
 
 def save_index():
-    try:
-        face_db().save()
-    except Exception:
-        app.logger.exception("could not write the face index")
+    with _index_lock:
+        try:
+            face_db().save()
+        except Exception:
+            app.logger.exception("could not write the face index")
 
 
-def _refresh_group_cache():
-    """Mirror the index into group_cache - photos with at least one face."""
-    idx = face_db()
-    group_cache.clear()
-    for fname in idx.photos:
-        faces = idx.faces.get(fname) or []
-        if faces:
-            group_cache[fname] = [f["embedding"] for f in faces]
-    return group_cache
+def total_indexed_photos():
+    """Number of photos in the index that have at least one detected face."""
+    with _index_lock:
+        idx = face_db()
+        return len([p for p in idx.photos if idx.faces.get(p)])
+
+
+def total_indexed_faces():
+    """Total number of detected faces across all photos in the index."""
+    with _index_lock:
+        idx = face_db()
+        return idx.total_faces()
 
 
 def index_photo(fname):
@@ -107,7 +146,8 @@ def index_photo(fname):
     GROUP_PHOTO_FOLDER and fold them into the index. Returns True if at least
     one face was found."""
     path = os.path.join(GROUP_PHOTO_FOLDER, fname)
-    idx = face_db()
+    if not os.path.isfile(path):
+        return False
     eng = engine()
     try:
         faces = eng.analyze(path)
@@ -115,25 +155,23 @@ def index_photo(fname):
         app.logger.exception("could not index %s", fname)
         return False
 
-    idx.folder = idx.folder or GROUP_PHOTO_FOLDER
-    idx.params = idx.params or face_index.params_for(eng)
-    idx.faces[fname] = [{"embedding": f["embedding"], "bbox": f["bbox"],
-                         "quality": f["quality"]} for f in faces]
-    try:
-        idx.stamps[fname] = face_index._stamp(path, idx.params)
-    except OSError:
-        idx.stamps.pop(fname, None)
-    if fname not in idx.photos:
-        idx.photos = sorted(set(idx.photos) | {fname})
+    with _index_lock:
+        idx = face_db()
+        idx.folder = idx.folder or GROUP_PHOTO_FOLDER
+        idx.params = idx.params or face_index.params_for(eng)
+        idx.faces[fname] = [{"embedding": f["embedding"], "bbox": f["bbox"],
+                             "quality": f["quality"]} for f in faces]
+        try:
+            idx.stamps[fname] = face_index._stamp(path, idx.params)
+        except OSError:
+            idx.stamps.pop(fname, None)
+        if fname not in idx.photos:
+            idx.photos = sorted(set(idx.photos) | {fname})
 
-    if faces:
-        group_cache[fname] = [f["embedding"] for f in faces]
-        return True
-    group_cache.pop(fname, None)
-    return False
+    return bool(faces)
 
 
-def build_group_cache():
+def rebuild_index():
     """(Re)scan GROUP_PHOTO_FOLDER and index the faces in every photo.
 
     Photos whose file hasn't changed since last time are carried over from the
@@ -141,20 +179,21 @@ def build_group_cache():
     5000-photo library costs 20 photos of work.
     """
     global model_error
-    group_cache.clear()
     if not os.path.isdir(GROUP_PHOTO_FOLDER):
         model_error = f"Folder '{GROUP_PHOTO_FOLDER}' doesn't exist. Edit GROUP_PHOTO_FOLDER at the top of app.py."
         return
     if not ensure_models():
         return
-    idx = face_db()
-    try:
-        idx.build(GROUP_PHOTO_FOLDER, engine(), progress=False)
-        idx.save()
-    except SystemExit as exc:      # folder holds no images
-        model_error = str(exc)
-        return
-    _refresh_group_cache()
+    with _index_lock:
+        idx = face_db()
+        try:
+            idx.build(GROUP_PHOTO_FOLDER, engine(), progress=False)
+            idx.save()
+        except SystemExit as exc:      # folder holds no images
+            model_error = str(exc)
+            return
+
+build_group_cache = rebuild_index  # alias for backwards compatibility
 
 
 def load_gallery_index():
@@ -162,11 +201,243 @@ def load_gallery_index():
     try:
         if os.path.isfile(GALLERY_INDEX_FILE):
             with open(GALLERY_INDEX_FILE, "r", encoding="utf-8") as f:
-                gallery_index = json.load(f)
+                data = json.load(f)
+                with gallery_lock:
+                    gallery_index.clear()
+                    gallery_index.update(data)
         else:
-            gallery_index = {}
+            with gallery_lock:
+                gallery_index.clear()
     except Exception:
-        gallery_index = {}
+        with gallery_lock:
+            gallery_index.clear()
+
+
+def fetch_gallery_json(url=None):
+    target = url or API_URL
+    resp = requests.get(target, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def download_gallery_image(url, dest_folder=GROUP_PHOTO_FOLDER):
+    os.makedirs(dest_folder, exist_ok=True)
+    filename = os.path.basename(url.split("?")[0])
+    dest_path = os.path.join(dest_folder, filename)
+    if os.path.isfile(dest_path):
+        return dest_path, False
+    r = requests.get(url, stream=True, timeout=30)
+    r.raise_for_status()
+    with open(dest_path, "wb") as f:
+        for chunk in r.iter_content(1024 * 8):
+            if chunk:
+                f.write(chunk)
+    return dest_path, True
+
+
+download_image = download_gallery_image  # alias for backwards compatibility
+
+
+def process_pending_indexing(photo_names, delay=INDEX_DELAY_SECONDS):
+    """Paced background indexing of photos with cooperative yielding to user requests.
+    Prevents GPU lock contention, thermal throttling, WDDM resets, and 502 Bad Gateway."""
+    if not photo_names:
+        return 0
+
+    indexed_count = 0
+    total = len(photo_names)
+    app.logger.info("Starting throttled background indexing for %d photo(s) (cooldown=%.2fs)...", total, delay)
+
+    for i, fname in enumerate(photo_names, 1):
+        # 1. Cooperative yield: If any user request is active or arrives, pause indexing immediately!
+        while _active_user_requests > 0:
+            app.logger.info("Background indexing paused: user request active. Yielding GPU...")
+            _user_activity_event.wait(timeout=2.0)
+
+        # 2. Safely index single photo on GPU with error isolation
+        try:
+            if index_photo(fname):
+                indexed_count += 1
+            if indexed_count % 5 == 0 or i == total:
+                save_index()
+        except Exception as e:
+            app.logger.warning("Error indexing photo %s: %s (skipping and continuing)", fname, e)
+
+        # 3. Cooldown pause between images to keep GPU utilization and VRAM stable
+        time.sleep(delay)
+
+        # 4. Periodically free unreferenced memory
+        if i % 10 == 0:
+            import gc
+            gc.collect()
+
+    save_index()
+    app.logger.info("Throttled background indexing completed: %d/%d photos indexed with faces.",
+                    indexed_count, total)
+    return indexed_count
+
+
+def update_gallery_index(auto_index=True):
+    """Fetch remote gallery images, download new ones into group_photos,
+    update gallery_index.json, and optionally index new faces into face_db."""
+    global gallery_index
+    try:
+        data = fetch_gallery_json(API_URL)
+    except Exception as e:
+        app.logger.warning("Failed to fetch gallery JSON: %s", e)
+        return {"status": False, "error": str(e), "new_downloaded": 0, "new_indexed": 0}
+
+    if not data or not data.get("status"):
+        app.logger.warning("Gallery API did not return success: %s", data)
+        return {"status": False, "error": "API returned non-success", "new_downloaded": 0, "new_indexed": 0}
+
+    image_entries = []
+    days = data.get("data", {}).get("days", [])
+    for day in days:
+        for img in day.get("images", []):
+            url = img.get("image_url") or img.get("image_path")
+            if url:
+                image_entries.append({"original_url": url})
+
+    if not image_entries:
+        return {"status": True, "new_downloaded": 0, "new_indexed": 0, "total_images": len(gallery_index)}
+
+    new_downloaded = []
+    new_entries = []
+    for entry in image_entries:
+        url = entry["original_url"]
+        try:
+            dest_path, is_new = download_gallery_image(url, GROUP_PHOTO_FOLDER)
+            fname = os.path.basename(dest_path)
+            new_entries.append((fname, url, dest_path))
+            if is_new:
+                new_downloaded.append(fname)
+                app.logger.info("  downloaded new gallery photo: %s", fname)
+        except Exception as e:
+            app.logger.error("Failed to download %s: %s", url, e)
+
+    if new_entries:
+        with gallery_lock:
+            for fname, url, dest_path in new_entries:
+                gallery_index[fname] = {"original_url": url, "local_path": dest_path}
+            try:
+                with open(GALLERY_INDEX_FILE, "w", encoding="utf-8") as f:
+                    json.dump(gallery_index, f, indent=2)
+            except Exception as e:
+                app.logger.error("Failed to save gallery index file: %s", e)
+
+    new_indexed = 0
+    if new_downloaded and auto_index and ensure_models():
+        new_indexed = process_pending_indexing(new_downloaded, delay=INDEX_DELAY_SECONDS)
+        app.logger.info("Gallery sync: %d new photos downloaded, %d indexed with faces",
+                        len(new_downloaded), new_indexed)
+
+    return {
+        "status": True,
+        "total_images": len(gallery_index),
+        "new_downloaded": len(new_downloaded),
+        "new_indexed": new_indexed
+    }
+
+
+def run_gallery_sync(auto_index=True):
+    """Run update_gallery_index with single-flight concurrency lock."""
+    global _gallery_sync_in_progress
+    with _gallery_sync_lock:
+        if _gallery_sync_in_progress:
+            app.logger.info("Gallery sync already in progress, skipping redundant trigger.")
+            return {
+                "status": True,
+                "message": "Gallery sync already in progress",
+                "in_progress": True,
+                "total_images": len(gallery_index)
+            }
+        _gallery_sync_in_progress = True
+
+    try:
+        return update_gallery_index(auto_index=auto_index)
+    finally:
+        with _gallery_sync_lock:
+            _gallery_sync_in_progress = False
+
+
+def _periodic_gallery_fetch_loop():
+    try:
+        run_gallery_sync(auto_index=True)
+    except Exception:
+        app.logger.exception("Initial gallery sync encountered an error")
+
+    while True:
+        time.sleep(FETCH_INTERVAL_SECONDS)
+        try:
+            run_gallery_sync(auto_index=True)
+        except Exception:
+            app.logger.exception("Periodic gallery sync encountered an error")
+
+
+def start_gallery_background_sync():
+    global _gallery_thread
+    with _gallery_thread_lock:
+        if _gallery_thread is None or not _gallery_thread.is_alive():
+            _gallery_thread = threading.Thread(target=_periodic_gallery_fetch_loop, daemon=True)
+            _gallery_thread.start()
+            app.logger.info("Background gallery sync started (interval: %ds)", FETCH_INTERVAL_SECONDS)
+
+
+def batch_match_single_person(folder=SINGLE_PERSON_FOLDER, accept=ACCEPT, review=REVIEW):
+    """Offline batch match for single_person reference photos against indexed group photos.
+    Uses GPU/FaceIndex directly and saves results_by_person.csv and results_by_photo.csv.
+    Does NOT use deprecated embeddings_cache.json."""
+    if not os.path.isdir(folder):
+        print(f"Folder '{folder}' does not exist.")
+        return False
+    if not ensure_models():
+        print("Models could not be loaded:", model_error)
+        return False
+
+    eng = engine()
+    people = {}
+    skipped = []
+    print(f"Loading reference people from {folder}...")
+    for fname in ge.list_images(folder):
+        name = os.path.splitext(fname)[0]
+        face = eng.primary_face(os.path.join(folder, fname))
+        if face is None:
+            skipped.append(fname)
+            continue
+        people.setdefault(name, []).append(face["embedding"])
+
+    if not people:
+        print("No usable reference faces found.")
+        return False
+
+    names = sorted(people.keys())
+    mats, owner = [], []
+    for i, name in enumerate(names):
+        vectors = np.stack(people[name]).astype(np.float32)
+        mats.append(vectors)
+        owner.extend([i] * len(vectors))
+
+    idx = face_db()
+    result = matcher.match(idx, names, np.vstack(mats), np.asarray(owner, np.int32),
+                           accept=accept, review=review)
+
+    with open("results_by_person.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["person", "num_group_photos", "group_photo_filenames"])
+        for name in names:
+            matched_photos = sorted({h["photo"] for h in result["by_person"][name] if h["status"] == "match"})
+            writer.writerow([name, len(matched_photos), ", ".join(matched_photos)])
+
+    with open("results_by_photo.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["group_photo", "people_present"])
+        for photo in idx.photos:
+            matched_names = sorted({h["person"] for h in result["by_photo"].get(photo, []) if h["status"] == "match"})
+            writer.writerow([photo, ", ".join(matched_names)])
+
+    print(f"Saved results_by_person.csv and results_by_photo.csv for {len(names)} people.")
+    return True
 
 
 def reference_embeddings(files):
@@ -320,9 +591,8 @@ INDEX_HTML = """
     <button type="submit" id="submitBtn" disabled>Find matches</button>
   </form>
 
-  <div class="status"><span>&#9670; indexed:</span> <span class="count">{{ num_cached }}</span> <span>group photo(s)</span></div>
-  <div class="rescan-row"><form action="/rescan" method="post"><button type="submit">rescan group_photos folder</button></form></div>
-  <div class="rescan-row"><a href="/admin" style="color:var(--ink-soft);text-decoration:underline;text-underline-offset:3px">+ add group photos</a></div>
+  <div class="status"><span>&#9670; auto-indexed:</span> <span class="count">{{ num_cached }}</span> <span>group photo(s)</span></div>
+  <div class="rescan-row"><a href="/admin" style="color:var(--ink-soft);text-decoration:underline;text-underline-offset:3px">+ add group photos</a> &middot; <a href="/docs" style="color:var(--ink-soft);text-decoration:underline;text-underline-offset:3px">API docs</a></div>
 </div>
 <script>
   const dz = document.getElementById('dropzone');
@@ -597,153 +867,201 @@ RESULTS_HTML = """
 @app.route("/")
 def index():
     err = model_error if not ensure_models() else None
-    return render_template_string(INDEX_HTML, num_cached=len(group_cache), error=err, message=None)
+    return render_template_string(INDEX_HTML, num_cached=total_indexed_photos(), error=err, message=None)
 
 
-@app.route("/rescan", methods=["POST"])
+@app.route("/rescan", methods=["POST", "GET"])
 def rescan():
-    if ensure_models():
-        build_group_cache()
-        load_gallery_index()
-        msg = f"Rescanned - {len(group_cache)} group photo(s) with a detected face are now indexed."
-        err = model_error
-    else:
-        msg, err = None, model_error
-    return render_template_string(INDEX_HTML, num_cached=len(group_cache), error=err, message=msg)
+    """Deprecated: indexing is now fully automatic in the background."""
+    msg = f"Automatic background indexing is active — {total_indexed_photos()} photos currently indexed."
+    return render_template_string(INDEX_HTML, num_cached=total_indexed_photos(), error=None, message=msg)
 
 
 @app.route("/admin")
 def admin():
-    return render_template_string(ADMIN_HTML, num_cached=len(group_cache),
+    return render_template_string(ADMIN_HTML, num_cached=total_indexed_photos(),
                                    total_files=count_group_photos(), error=None, message=None)
 
 
 @app.route("/admin/upload", methods=["POST"])
 def admin_upload():
-    os.makedirs(GROUP_PHOTO_FOLDER, exist_ok=True)
+    with UserGPUContext():
+        os.makedirs(GROUP_PHOTO_FOLDER, exist_ok=True)
 
-    files = [f for f in request.files.getlist("photos") if f and f.filename]
-    if not files:
-        return render_template_string(ADMIN_HTML, num_cached=len(group_cache),
-                                       total_files=count_group_photos(),
-                                       error="Choose at least one photo to upload.", message=None)
+        files = [f for f in request.files.getlist("photos") if f and f.filename]
+        if not files:
+            return render_template_string(ADMIN_HTML, num_cached=total_indexed_photos(),
+                                           total_files=count_group_photos(),
+                                           error="Choose at least one photo to upload.", message=None)
 
-    saved, rejected, straightened = [], [], []
-    for f in files:
-      safe_name = secure_filename(f.filename)
-      if not safe_name or not safe_name.lower().endswith(IMAGE_EXTS):
-        rejected.append(f.filename)
-        continue
-      dest = unique_path(GROUP_PHOTO_FOLDER, safe_name)
-   
-      try:
-        img_pil = ImageOps.exif_transpose(Image.open(f.stream))
-        turn = 0
-        if ensure_models():
-          turn, _ = engine().detect_rotation(pil_to_bgr(img_pil))
-        if turn:
-          img_pil = rotate_pil_clockwise(img_pil, turn)
-          straightened.append(f"{os.path.basename(dest)} ({turn}°)")
-        exif = img_pil.getexif()
-        exif.pop(EXIF_ORIENTATION_TAG, None)  
-        save_kwargs = {"exif": exif.tobytes()} if len(exif) else {}
-        img_pil.convert("RGB").save(dest, **save_kwargs)
-      except Exception:
-   
-        app.logger.exception("could not re-save %s upright; storing it as uploaded", safe_name)
-        straightened = [s for s in straightened if not s.startswith(os.path.basename(dest))]
-        f.stream.seek(0)
-        with open(dest, "wb") as out:
-          out.write(f.stream.read())
-      saved.append(os.path.basename(dest))
+        saved, rejected, straightened = [], [], []
+        for f in files:
+          safe_name = secure_filename(f.filename)
+          if not safe_name or not safe_name.lower().endswith(IMAGE_EXTS):
+            rejected.append(f.filename)
+            continue
+          dest = unique_path(GROUP_PHOTO_FOLDER, safe_name)
+       
+          try:
+            img_pil = ImageOps.exif_transpose(Image.open(f.stream))
+            turn = 0
+            if ensure_models():
+              turn, _ = engine().detect_rotation(pil_to_bgr(img_pil))
+            if turn:
+              img_pil = rotate_pil_clockwise(img_pil, turn)
+              straightened.append(f"{os.path.basename(dest)} ({turn}°)")
+            exif = img_pil.getexif()
+            exif.pop(EXIF_ORIENTATION_TAG, None)  
+            save_kwargs = {"exif": exif.tobytes()} if len(exif) else {}
+            img_pil.convert("RGB").save(dest, **save_kwargs)
+          except Exception:
+       
+            app.logger.exception("could not re-save %s upright; storing it as uploaded", safe_name)
+            straightened = [s for s in straightened if not s.startswith(os.path.basename(dest))]
+            f.stream.seek(0)
+            with open(dest, "wb") as out:
+              out.write(f.stream.read())
+          saved.append(os.path.basename(dest))
 
-    indexed = 0
-    if saved and ensure_models():
-        for fname in saved:
-            if index_photo(fname):
-                indexed += 1
-        save_index()
+        indexed = 0
+        if saved and ensure_models():
+            for fname in saved:
+                if index_photo(fname):
+                    indexed += 1
+            save_index()
 
-    parts = []
-    if saved:
-        parts.append(f"Added {len(saved)} photo(s): {', '.join(saved)} ({indexed} indexed, "
-                      f"{len(saved) - indexed} had no detectable face but are still saved)")
-    if straightened:
-        parts.append(f"Straightened sideways photo(s): {', '.join(straightened)}")
-    if rejected:
-        parts.append(f"Skipped (not an image file): {', '.join(rejected)}")
+        parts = []
+        if saved:
+            parts.append(f"Added {len(saved)} photo(s): {', '.join(saved)} ({indexed} indexed, "
+                          f"{len(saved) - indexed} had no detectable face but are still saved)")
+        if straightened:
+            parts.append(f"Straightened sideways photo(s): {', '.join(straightened)}")
+        if rejected:
+            parts.append(f"Skipped (not an image file): {', '.join(rejected)}")
 
-    return render_template_string(
-        ADMIN_HTML, num_cached=len(group_cache), total_files=count_group_photos(),
-        message=" · ".join(parts) if saved else None,
-        error=None if saved else " · ".join(parts) if parts else "Nothing was uploaded.",
-    )
+        return render_template_string(
+            ADMIN_HTML, num_cached=total_indexed_photos(), total_files=count_group_photos(),
+            message=" · ".join(parts) if saved else None,
+            error=None if saved else " · ".join(parts) if parts else "Nothing was uploaded.",
+        )
 
 
 @app.route("/match", methods=["POST"])
 def match():
-    if not ensure_models():
-        return render_template_string(INDEX_HTML, num_cached=len(group_cache), error=model_error, message=None)
+    with UserGPUContext():
+        if not ensure_models():
+            return render_template_string(INDEX_HTML, num_cached=total_indexed_photos(), error=model_error, message=None)
 
-    if not group_cache:
-        build_group_cache()
+        if total_indexed_photos() == 0:
+            rebuild_index()
 
-    files = get_uploaded_files("photos")
-    if not files:
-      return render_template_string(INDEX_HTML, num_cached=len(group_cache),
-                       error="Choose at least one photo first.", message=None)
+        files = get_uploaded_files("photos")
+        if not files:
+          return render_template_string(INDEX_HTML, num_cached=total_indexed_photos(),
+                           error="Choose at least one photo first.", message=None)
 
-    require_all = request.form.get("require_all") == "on"
+        require_all = request.form.get("require_all") == "on"
 
-    people, skipped = reference_embeddings(files)
-    if not people:
-        return render_template_string(INDEX_HTML, num_cached=len(group_cache),
-                                       error="No face found in any of those photos - try clearer, front-facing shots.",
-                                       message=None)
+        people, skipped = reference_embeddings(files)
+        if not people:
+            return render_template_string(INDEX_HTML, num_cached=total_indexed_photos(),
+                                           error="No face found in any of those photos - try clearer, front-facing shots.",
+                                           message=None)
 
-    results = find_matches(people, require_all)
+        results = find_matches(people, require_all)
 
-    return render_template_string(RESULTS_HTML, results=results, people=sorted(people.keys()),
-                                   skipped=skipped, require_all=require_all)
+        return render_template_string(RESULTS_HTML, results=results, people=sorted(people.keys()),
+                                       skipped=skipped, require_all=require_all)
 
 
 @app.route("/api/match", methods=["POST"])
 def api_match():
-  if not ensure_models():
-    return jsonify(error=model_error), 500
+    with UserGPUContext():
+        if not ensure_models():
+            return jsonify(error=model_error), 500
 
-  if not group_cache:
-    build_group_cache()
+        if total_indexed_photos() == 0:
+            rebuild_index()
 
-  files = get_uploaded_files("photos")
-  if not files:
-    
-    return jsonify(error="Choose at least one photo first.", received_keys=list(request.files.keys())), 400
+        files = get_uploaded_files("photos")
+        if not files:
+            return jsonify(error="Choose at least one photo first.", received_keys=list(request.files.keys())), 400
 
-  require_all = request.form.get("require_all") == "on"
+        require_all = request.form.get("require_all") == "on"
 
-  people, skipped = reference_embeddings(files)
-  if not people:
-    return jsonify(error="No face found in any of those photos - try clearer, front-facing shots."), 400
+        people, skipped = reference_embeddings(files)
+        if not people:
+            return jsonify(error="No face found in any of those photos - try clearer, front-facing shots."), 400
 
-  results = []
-  for fname, matched_names in find_matches(people, require_all):
-    orig_entry = gallery_index.get(fname)
-    orig = orig_entry.get("original_url") if isinstance(orig_entry, dict) else None
-    results.append({
-      "filename": fname,
-      "url": f"/group_photo/{fname}",
-      "original_url": orig,
-      "matched_names": matched_names,
+        with gallery_lock:
+            gallery_copy = dict(gallery_index)
+
+        results = []
+        for fname, matched_names in find_matches(people, require_all):
+            orig_entry = gallery_copy.get(fname)
+            orig = orig_entry.get("original_url") if isinstance(orig_entry, dict) else None
+            results.append({
+                "filename": fname,
+                "url": f"/group_photo/{fname}",
+                "original_url": orig,
+                "matched_names": matched_names,
+            })
+
+        return jsonify({
+            "people": sorted(people.keys()),
+            "skipped": skipped,
+            "require_all": require_all,
+            "results": results,
+            "indexed_group_photos": total_indexed_photos(),
+        })
+
+
+@app.route("/gallery", methods=["GET"])
+def gallery_endpoint():
+    """Gallery endpoint synced from gallery_search.py on single port."""
+    with gallery_lock:
+        return jsonify({"status": True, "images": dict(gallery_index)})
+
+
+@app.route("/api/gallery/sync", methods=["POST", "GET"])
+def gallery_sync():
+    """Trigger manual gallery synchronization and indexing (non-blocking)."""
+    with _gallery_sync_lock:
+        is_running = _gallery_sync_in_progress
+
+    if is_running:
+        return jsonify({
+            "status": True,
+            "message": "Gallery sync already running in background",
+            "sync_running": True,
+            "total_gallery_images": len(gallery_index),
+            "indexed_photos": total_indexed_photos()
+        })
+
+    threading.Thread(target=run_gallery_sync, kwargs={"auto_index": True}, daemon=True).start()
+    return jsonify({
+        "status": True,
+        "message": "Gallery sync started in background",
+        "sync_running": True,
+        "total_gallery_images": len(gallery_index),
+        "indexed_photos": total_indexed_photos()
     })
 
-  return jsonify({
-    "people": sorted(people.keys()),
-    "skipped": skipped,
-    "require_all": require_all,
-    "results": results,
-    "indexed_group_photos": len(group_cache),
-  })
+
+@app.route("/api/gallery/status", methods=["GET"])
+def gallery_status():
+    """Get current synchronization and indexing status."""
+    with _gallery_sync_lock:
+        is_running = _gallery_sync_in_progress
+    with gallery_lock:
+        total_gal = len(gallery_index)
+    return jsonify({
+        "status": True,
+        "sync_running": is_running,
+        "total_gallery_images": total_gal,
+        "indexed_photos": total_indexed_photos(),
+        "total_faces": total_indexed_faces()
+    })
 
 
 @app.route("/group_photo/<path:filename>")
@@ -806,9 +1124,20 @@ DOCS_HTML = """
   </div>
 
   <div class="section card">
-    <h2>POST /rescan</h2>
-    <p>Rebuilds the face embedding index from the images currently stored in <code>group_photos/</code>.</p>
+    <h2>GET /api/gallery/status</h2>
+    <p>Returns current background sync and GPU indexing status along with total photo and face counts. Group photos are automatically embedded in the background.</p>
   </div>
+
+  <div class="section card">
+    <h2>GET /gallery</h2>
+    <p>Returns JSON dictionary of all synchronized remote gallery images mapped to their local paths and original URLs.</p>
+  </div>
+
+  <div class="section card">
+    <h2>POST /api/gallery/sync</h2>
+    <p>Triggers asynchronous synchronization with the remote summit gallery API and throttled background GPU indexing.</p>
+  </div>
+
 
   <div class="section card">
     <h2>GET /admin</h2>
@@ -831,7 +1160,7 @@ DOCS_HTML = """
 
   <div class="section card">
     <h2>POST /api/match</h2>
-    <p>Returns a JSON-only result set with group photo matches and image URLs.</p>
+    <p>Returns a JSON-only result set with group photo matches, original remote URLs, and local image URLs.</p>
     <p>Form fields:</p>
     <ul>
       <li><code>photos</code> — one or more image files. The file name is the person's name; several shots of one person can be sent as <code>Ravi_1.jpg</code>, <code>Ravi_2.jpg</code> and are merged into one identity</li>
@@ -846,7 +1175,7 @@ DOCS_HTML = """
 
   <div class="section">
     <h2>Example cURL</h2>
-    <pre>curl -F "photos=@person1.jpg" -F "photos=@person2.jpg" http://127.0.0.1:5001/match</pre>
+    <pre>curl -F "photos=@person1.jpg" -F "photos=@person2.jpg" http://127.0.0.1:5001/api/match</pre>
   </div>
 </div>
 </body></html>
@@ -858,13 +1187,15 @@ def docs():
     return render_template_string(DOCS_HTML)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Photo match web app")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="Host/IP address to bind to (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=5001,
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Photo match web app & gallery service")
+    parser.add_argument("--host", default=os.environ.get("PICMATCH_HOST", "0.0.0.0"),
+                        help="Host/IP address to bind to (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PICMATCH_PORT", os.environ.get("PORT", 5001))),
                         help="Port to listen on (default: 5001)")
-    args = parser.parse_args()
+    parser.add_argument("--no-gallery-sync", action="store_true",
+                        help="Disable automatic background gallery sync")
+    args = parser.parse_args(argv)
 
     try:
         ipaddress.ip_address(args.host)
@@ -877,19 +1208,30 @@ def parse_args():
     return args
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
-    print("Loading models and scanning group_photos/ ...")
+    print("Loading models and initializing index ...")
     print(settings_summary())
     if ensure_models():
-        build_group_cache()
+        idx = face_db()
+        if not idx.photos:
+            rebuild_index()
         load_gallery_index()
-        faces = sum(len(v) for v in group_cache.values())
-        print(f"Indexed {len(group_cache)} group photo(s), {faces} face(s).")
+        faces = total_indexed_faces()
+        photos = total_indexed_photos()
+        print(f"Loaded index: {photos} group photo(s), {faces} face(s).")
     else:
         print(f"Warning: {model_error}")
         print("The app will still start - fix the issue above, then click 'rescan' on the page.")
 
+    if not args.no_gallery_sync and AUTO_SYNC_GALLERY:
+        start_gallery_background_sync()
+
     print(f"\nOpen this address in your browser: http://{args.host}:{args.port}\n")
+    print(f"Endpoints: Web UI: http://{args.host}:{args.port}/ | Gallery: http://{args.host}:{args.port}/gallery | Docs: http://{args.host}:{args.port}/docs\n")
     app.run(debug=False, port=args.port, host=args.host)
+
+
+if __name__ == "__main__":
+    main()
