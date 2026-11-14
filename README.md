@@ -19,6 +19,11 @@ venv\Scripts\python app.py --host 0.0.0.0 --port 5001
 First start loads both ONNX models and reads `data/index.npz`; photos whose
 file hasn't changed are reused, so it comes up in seconds.
 
+`app.py` also starts the IDF audit service from `idf_audit/` on port 5008
+(`--idf-port` for another, `--no-idf` for Picmatch alone), in IDF's own
+environment, and stops it when Picmatch stops. If something already listens on
+that port, it is left alone and used as is.
+
 ## Picmatch and IDF on one domain
 
 `run.py` starts Picmatch (port 5001) and the IDF audit service in `idf_audit/`
