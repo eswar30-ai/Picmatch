@@ -1,7 +1,7 @@
 """Start the IDF audit service.
 
-    python run.py                      # http://<this machine's IP>:8090, reachable from the network
-    python run.py --port 8091          # another port
+    python run.py                      # http://<this machine's IP>:5008, reachable from the network
+    python run.py --port 5009          # another port
     python run.py --host 127.0.0.1     # this machine only
 
 Any `python` will do: if it is not this service's own `.venv` interpreter, this
@@ -73,7 +73,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Start the IDF audit service.")
     parser.add_argument("--host", default="0.0.0.0",
                         help="0.0.0.0 (the default) listens on every network address; 127.0.0.1 = this machine only")
-    parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--port", type=int, default=5008)
     args = parser.parse_args()
 
     os.chdir(ROOT)
