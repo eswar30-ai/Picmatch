@@ -20,7 +20,10 @@ the judgement, EXIF for where a photo was taken.
     app.py        the API: POST /api/audit, GET /api/audit/{id}, GET /api/health
 
 The judgement is advice to a human reviewer (their pipeline goes AI audit ->
-manual review -> scoring). So the rule throughout is: say `approved` only when
-the evidence shows it, `rejected` only when the evidence contradicts it, and
-`changes_required` whenever it cannot tell - never a confident answer from nothing.
+manual review -> scoring). So the rule throughout the checks is: `approved`
+only when the evidence shows it, `rejected` only when the evidence contradicts
+it, and `changes_required` whenever it cannot tell - never a confident answer
+from nothing. IDF wants only two outcomes (2026-11-14), so each
+`changes_required` is then decided by its score (checks.decided, APPROVE_SCORE)
+and the details say it was not confirmed.
 """

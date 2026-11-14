@@ -4,12 +4,17 @@ same readings always give the same verdict.
     certification   evidence_review, image_location_validation, detail_evidence_match, overall
     program         supporting_materials, content_review, program_details_match, overall
 
-Each check is `{"check_type", "status", "score", "details"}`: status one of
-`approved`, `changes_required`, `rejected` - the three words their own
-`required_checks[overall].description` names; score 0 to 100; details one or two
-sentences a reviewer can act on. The overall status is the worst of the
-three, never better: one contradicted claim is not averaged away by two
-good photos.
+Each check is `{"check_type", "status", "score", "details"}`: score 0 to 100;
+details one or two sentences a reviewer can act on. The overall status is the
+worst of the three, never better: one contradicted claim is not averaged away
+by two good photos.
+
+The checks themselves work in three statuses - `approved`, `changes_required`
+(cannot be told either way), `rejected` - but IDF wants only two (decision of
+2026-11-14). `decided` turns each `changes_required` into `approved` at
+APPROVE_SCORE or above and `rejected` below it; audit.run applies it to every
+status in the result, last, so what the checks found is unchanged and the
+details still say what was not confirmed.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from idf import settings
 from idf.helpers import _on_page
 from idf.evidence import text_of
 from idf.package import Answer, Evidence, Package
@@ -38,6 +44,28 @@ def worst(statuses: list[str]) -> str:
         if status in present:
             return status
     return "approved"
+
+
+#: What cannot be told either way is approved at this score or above, rejected below it.
+APPROVE_SCORE = settings.number("APPROVE_SCORE", 80)
+
+
+def decide(status: str, score: float) -> str:
+    """`approved` or `rejected`: a `changes_required` is decided by its score."""
+    if status != "changes_required":
+        return status
+    return "approved" if score >= APPROVE_SCORE else "rejected"
+
+
+def decided(check: dict[str, Any]) -> dict[str, Any]:
+    """A check with its `changes_required` decided by score, saying so in its details."""
+    if check["status"] != "changes_required":
+        return check
+    status = decide(check["status"], check["score"])
+    side = "at or above" if status == "approved" else "below"
+    return _check(check["check_type"], status, check["score"],
+                  f"{check['details'].rstrip('.')}. Not confirmed either way; the score {check['score']} "
+                  f"is {side} {APPROVE_SCORE}, so {status}")
 
 
 def _check(check_type: str, status: str, score: float, details: str) -> dict[str, Any]:
@@ -267,7 +295,7 @@ def overall(checks: list[dict[str, Any]]) -> dict[str, Any]:
         score = min(score, 30)
     else:
         pending = [c["check_type"] for c in checks if c["status"] == "changes_required"]
-        details = "A person should look at: " + ", ".join(pending)
+        details = "Not confirmed: " + ", ".join(pending)
     return _check("overall", status, score, details)
 
 

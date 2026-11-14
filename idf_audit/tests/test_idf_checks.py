@@ -120,6 +120,12 @@ def test_program_details_match_looks_for_title_venue_and_dates_on_the_files():
 
 # --- the audit as a whole -------------------------------------------------------
 
+def assert_two_outcomes(result):
+    """IDF gets only approved or rejected, at every level."""
+    statuses = [result["status"]] + [c["status"] for c in result["checks"]] +                [s for e in result["evidence"] for s in (e["ai_status"], e["status"], (e["location"] or {}).get("status"))]
+    assert set(statuses) - {None} <= {"approved", "rejected"}, statuses
+
+
 def fake_reader(answers):
     def reader(path: Path, claim: str):
         return answers[path.name]
@@ -137,7 +143,12 @@ def test_run_gives_their_callback_body_and_our_detail(tmp_path):
     assert result["target_type"] == "certification" and result["application_id"] == 26
     assert [c["check_type"] for c in result["checks"]] == [
         "evidence_review", "image_location_validation", "detail_evidence_match", "overall"]
-    assert result["status"] == "changes_required"                 # the files carry no GPS
+    # The files carry no GPS, so the location check cannot tell: decided by score, and said so.
+    assert result["status"] == checks.decide("changes_required", result["score"])
+    assert "not confirmed on" in result["comments"] and "image_location_validation" in result["comments"]
+    assert f"(score {result['score']}, " in result["comments"]
+    assert "Not confirmed" in result["checks"][-1]["details"]
+    assert_two_outcomes(result)
     assert [e["id"] for e in result["evidence"]] == [39, 40, 42] and result["evidence"][2]["location"] is None
     body = audit.callback_body(result)
     assert set(body) == {"status", "score", "comments", "checks", "evidence"} and 0 <= body["score"] <= 100
@@ -151,17 +162,17 @@ def test_each_file_gets_one_verdict_and_one_note():
     far = {"status": "rejected", "score": 10, "details": "the file's GPS is 5004 m from the declared position: not the declared place"}
     none = {"status": "changes_required", "score": 40, "details": "the file carries no GPS data, so the declared position cannot be checked"}
     shows = {**read("yes", 0.95), "reason": "A FITNESS CENTER sign over gym machines."}
-    assert audit.file_verdict(shows, near) == ("approved", "A FITNESS CENTER sign over gym machines.")
-    assert audit.file_verdict(shows, None) == ("approved", "A FITNESS CENTER sign over gym machines.")
-    status, note = audit.file_verdict(shows, far)                 # the right picture, in the wrong place
+    assert audit.file_verdict(shows, near) == ("approved", "A FITNESS CENTER sign over gym machines.", 95)
+    assert audit.file_verdict(shows, None) == ("approved", "A FITNESS CENTER sign over gym machines.", 95)
+    status, note, _ = audit.file_verdict(shows, far)              # the right picture, in the wrong place
     assert status == "rejected" and note.startswith("A FITNESS") and "Location: the file's GPS is 5004 m" in note
-    status, note = audit.file_verdict(shows, none)
-    assert status == "changes_required" and "no GPS data" in note
-    status, note = audit.file_verdict({**read("no", 0.9), "reason": "A car park."}, near)
+    status, note, score = audit.file_verdict(shows, none)         # no GPS: its score, not the picture's
+    assert status == "changes_required" and "no GPS data" in note and score == 40
+    status, note, _ = audit.file_verdict({**read("no", 0.9), "reason": "A car park."}, near)
     assert status == "rejected" and note == "Does not show it: A car park."
-    status, note = audit.file_verdict({**read("unsure", 0.5), "reason": ""}, None)
-    assert status == "changes_required" and note == "Cannot be told from the file: no clear answer"
-    status, note = audit.file_verdict({**read("yes", 0.9), "reason": "x" * 900}, far)
+    status, note, score = audit.file_verdict({**read("unsure", 0.5), "reason": ""}, None)
+    assert status == "changes_required" and note == "Cannot be told from the file: no clear answer" and score == 40
+    status, note, _ = audit.file_verdict({**read("yes", 0.9), "reason": "x" * 900}, far)
     assert len(note) <= audit.NOTE_MAX
 
 
@@ -208,9 +219,9 @@ def test_the_same_file_uploaded_for_two_requirements_is_flagged(tmp_path):
                "policy.pdf": {**read("yes", 0.9), "kind": "document"}}
     result = audit.run(p, files, read_photo=fake_reader(answers), read_document=fake_reader(answers))
     review = result["checks"][0]
-    assert review["status"] == "changes_required" and "the same file" in review["details"]
+    assert review["status"] == "rejected" and "the same file" in review["details"]     # at most 50, below 80
     by_id = {e["id"]: e for e in result["evidence"]}
-    assert by_id[39]["ai_status"] == "changes_required" and "PA Promotion Signage" in by_id[39]["ai_note"]
+    assert by_id[39]["ai_status"] == "rejected" and "PA Promotion Signage" in by_id[39]["ai_note"]
     assert by_id[40]["same_file_as"] == [39] and by_id[42]["same_file_as"] == []
     assert result["status"] != "approved"
 
@@ -279,3 +290,34 @@ def test_a_model_that_does_not_answer_still_fails_the_audit_with_text_read_ahead
     monkeypatch.setattr(evidence, "ask", down)
     with pytest.raises(ModelDidNotAnswer):
         audit.run(p, files)
+
+
+@pytest.mark.parametrize("status,score,decided", [
+    ("approved", 10, "approved"), ("rejected", 95, "rejected"),        # a clear answer is never overturned
+    ("changes_required", 80, "approved"), ("changes_required", 79, "rejected"),
+])
+def test_what_cannot_be_told_is_decided_by_its_score(status, score, decided):
+    assert checks.decide(status, score) == decided
+
+
+def test_a_decided_check_says_it_was_not_confirmed_and_how_it_was_decided():
+    c = checks.decided({"check_type": "content_review", "status": "changes_required", "score": 86, "details": "thin agenda."})
+    assert c["status"] == "approved" and c["score"] == 86
+    assert c["details"] == "thin agenda. Not confirmed either way; the score 86 is at or above 80, so approved"
+
+
+def test_the_threshold_moves_the_line(tmp_path, monkeypatch):
+    monkeypatch.setattr(checks, "APPROVE_SCORE", 90)
+    assert checks.decide("changes_required", 86) == "rejected"
+
+
+def test_an_unsure_photo_never_comes_back_as_changes_required(tmp_path):
+    p = package.parse(CERTIFICATION)
+    files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
+    for name, f in files.items():
+        f.write_bytes(str(name).encode())
+    answers = {"gym.jpg": read("unsure", 0.5), "posters.jpg": read("yes", 0.95), "policy.pdf": {**read("yes", 0.9), "kind": "document"}}
+    result = audit.run(p, files, read_photo=fake_reader(answers), read_document=fake_reader(answers))
+    assert_two_outcomes(result)
+    gym = next(e for e in result["evidence"] if e["id"] == 39)
+    assert gym["ai_status"] == "rejected" and gym["ai_note"].startswith("Cannot be told from the file")
