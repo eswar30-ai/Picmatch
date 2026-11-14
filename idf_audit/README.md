@@ -1,9 +1,9 @@
 # IDF audit service
 
 Judges an IDF certification application or program against its evidence photos
-and documents, and answers in the shape IDF's backend expects: `approved`,
-`changes_required` or `rejected`, a score, and four checks. The verdict is
-advice to IDF's manual reviewer, never a decision.
+and documents, and answers in the shape IDF's backend expects: `approved` or
+`rejected`, a score, and four checks. The verdict is advice to IDF's manual
+reviewer, never a decision.
 
 It is the IDF audit from the OCR platform (`D:\ocr-platform`, decision D29),
 taken out to run on its own: RapidOCR reads the text in each photo, Qwen2.5-VL
@@ -47,6 +47,14 @@ and per file `ai_status` and `ai_note`, with the detail behind them. GPS is
 judged only for photos marked `requires_gps`; otherwise the location check says
 "not checked" and does not count.
 
+Only `approved` and `rejected` are answered, at every level: overall, each
+check, each file. The checks work out a third answer internally - the evidence
+neither confirms nor contradicts it - and that is decided by its score:
+`APPROVE_SCORE` (80) or above is approved, below it rejected. Its details then
+say "Not confirmed either way; the score N is below 80, so rejected", so a
+reviewer can tell it from a contradiction. A photo without GPS where GPS is
+required cannot be confirmed, which usually brings a certification below 80.
+
 Errors: `400` bad package, missing file, or a file that is not a readable image
 or PDF; `401` no valid key; `413` over `MAX_UPLOAD_SIZE_MB`; `415` file type
 not audited; `429` and `503` wait `Retry-After` seconds.
@@ -60,6 +68,7 @@ not audited; `429` and `503` wait `Retry-After` seconds.
 | `IDF_BASE_URL` | `http://192.168.214.23:4000` | IDF's server, for files given by path |
 | `IDF_POST_CALLBACK` | `false` | Post the verdict to the package's callback; off, IDF fetches it by GET |
 | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | `http://127.0.0.1:11434`, `qwen2.5vl:7b` | The vision model |
+| `APPROVE_SCORE` | 80 | What can't be confirmed either way is approved at this score or above, rejected below |
 | `MAX_UPLOAD_SIZE_MB`, `UPLOAD_RATE_LIMIT_PER_MINUTE`, `MAX_QUEUED` | 50, 10, 100 | Limits |
 | `IDF_DATA_DIR` | `var/` here | Where packages, files, verdicts and job states are kept |
 

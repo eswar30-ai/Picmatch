@@ -42,17 +42,20 @@ def claim_for(package: Package, item: Evidence) -> str:
 
 
 def comments_for(package: Package, result_checks: list[dict[str, Any]], reads: dict[int, dict[str, Any]]) -> str:
-    """One line for the reviewer's list."""
-    final = result_checks[-1]
+    """One line for the reviewer's list, from the checks before `checks.decided`:
+    what the evidence contradicts, and what it could not confirm either way."""
+    final = checks.decided(result_checks[-1])
     shown = sum(1 for r in reads.values() if checks.evidence_status(r)[0] == "approved")
     head = f"{shown} of {len(reads)} evidence file(s) show what they were uploaded for"
-    if final["status"] == "approved":
-        return f"{head}; every check passed."
     rejected = [c["check_type"] for c in result_checks[:-1] if c["status"] == "rejected"]
     pending = [c["check_type"] for c in result_checks[:-1] if c["status"] == "changes_required"]
-    parts = ([f"rejected on {', '.join(rejected)}"] if rejected else []) + \
-            ([f"changes required on {', '.join(pending)}"] if pending else [])
-    return f"{head}; {'; '.join(parts)}."
+    if not rejected and not pending:
+        return f"{head}; every check passed."
+    parts = ([f"contradicted on {', '.join(rejected)}"] if rejected else []) + \
+            ([f"not confirmed on {', '.join(pending)}"] if pending else [])
+    side = f"{checks.APPROVE_SCORE} or above" if final["status"] == "approved" else f"below {checks.APPROVE_SCORE}"
+    by_score = f" (score {final['score']}, {side})" if result_checks[-1]["status"] == "changes_required" else ""
+    return f"{head}; {'; '.join(parts)}: {final['status']}{by_score}."
 
 
 def same_files(files: dict[int, Path]) -> dict[int, list[int]]:
@@ -66,13 +69,15 @@ def same_files(files: dict[int, Path]) -> dict[int, list[int]]:
 
 
 def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
-                 same_as: list[str] | None = None) -> tuple[str, str]:
-    """One file's `ai_status` and `ai_note`, for IDF's evidence record: what the
-    file shows and, for a photo whose position is checked, where it was taken,
-    together. The worse of the two decides: the right picture taken 5 km from the
-    declared place is not approved. A file also uploaded for another requirement
-    (`same_as`, their titles) is at best `changes_required`."""
-    status, _ = checks.evidence_status(read)
+                 same_as: list[str] | None = None) -> tuple[str, str, int]:
+    """One file's `ai_status`, `ai_note` and the score behind the status, for
+    IDF's evidence record: what the file shows and, for a photo whose position
+    is checked, where it was taken, together. The worse of the two decides: the
+    right picture taken 5 km from the declared place is not approved. A file
+    also uploaded for another requirement (`same_as`, their titles) is at best
+    `changes_required`, at a score of at most 50. Three-way, like the checks:
+    audit.run decides a `changes_required` by the score."""
+    status, score = checks.evidence_status(read)
     reason = (read.get("reason") or "").strip()
     if status == "approved":
         note = reason or "Shows what it was uploaded for."
@@ -84,12 +89,14 @@ def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
         status = checks.worst([status, finding["status"]])
         if finding["status"] != "approved":
             note = f"{note.rstrip('.')}. Location: {finding['details']}"
+            score = min(score, finding["score"])
     if same_as:
         status = checks.worst([status, "changes_required"])
         note = f"The same file was also uploaded for {', '.join(same_as)}. {note}"
+        score = min(score, 50)
     if len(note) > NOTE_MAX:
         note = note[:NOTE_MAX - 3].rstrip() + "..."
-    return status, note
+    return status, note, score
 
 
 def run(package: Package, files: dict[int, Path], *, read_photo: Reader = evidence.read_photo,
@@ -130,23 +137,31 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
         result_checks = checks.certification_checks(package, reads, findings, same)
     else:
         result_checks = checks.program_checks(package, reads, same)
+    # IDF gets only approved or rejected: every `changes_required` - checks, files,
+    # their locations - is decided by its own score here, after the checks ran.
+    comments = comments_for(package, result_checks, reads)
+    result_checks = [checks.decided(c) for c in result_checks]
     final = result_checks[-1]
     items = []
     for item in package.evidence:
         read = reads[item.id]
         status, score = checks.evidence_status(read)
         twins = [e for e in package.evidence if e.id in same.get(item.id, [])]
-        ai_status, ai_note = file_verdict(read, findings.get(item.id), [checks.label(e) for e in twins])
+        ai_status, ai_note, file_score = file_verdict(read, findings.get(item.id), [checks.label(e) for e in twins])
+        finding = findings.get(item.id)
+        if finding:
+            finding = {**finding, "status": checks.decide(finding["status"], finding["score"])}
         items.append({"id": item.id, "title": item.title, "kind": item.kind, "name": item.name,
-                      "ai_status": ai_status, "ai_note": ai_note, "same_file_as": [e.id for e in twins],
-                      "status": status, "score": score, "shows": read["shows"],
+                      "ai_status": checks.decide(ai_status, file_score), "ai_note": ai_note,
+                      "same_file_as": [e.id for e in twins],
+                      "status": checks.decide(status, score), "score": score, "shows": read["shows"],
                       "confidence": read["confidence"], "reason": read["reason"],
                       "description": read["description"], "text": read["text"],
-                      "location": findings.get(item.id)})
+                      "location": finding})
     return {
         "target_type": package.target_type, package.id_key: package.target_id, "number": package.number,
         "status": final["status"], "score": final["score"],
-        "comments": comments_for(package, result_checks, reads),
+        "comments": comments,
         "checks": result_checks,
         "evidence": items,
         "claims": checks.claims(package, reads) if package.target_type == "certification" else [],
