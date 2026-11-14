@@ -1,0 +1,5 @@
+# This service's own: its environment, its settings, and everything it receives.
+.venv/
+.env
+!.env.example
+var/
