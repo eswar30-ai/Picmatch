@@ -191,6 +191,14 @@ def audit_answer(audit_id: str, request: Request) -> Any:
             **answer_body(result)}
 
 
+@app.api_route("/", methods=["GET", "HEAD"])
+def root() -> dict[str, str]:
+    """What this is and where to go: for a browser opening the address, a link
+    preview, or an uptime check - all of which got 404 here before."""
+    return {"service": "IDF audit", "health": "/api/health", "submit": "POST /api/audit",
+            "result": "GET /api/audit/{audit_id}"}
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     """Whether the vision model is up, and how many audits wait. No key, no audit data."""
