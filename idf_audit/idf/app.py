@@ -22,9 +22,11 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from idf import access, fetch, jobs, ocr, settings
 from idf.audit import answer_body
@@ -52,6 +54,16 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="IDF audit", lifespan=lifespan)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def refused(request: Request, exc: StarletteHTTPException) -> Any:
+    """Every refusal (400, 401, 404, 413, 415, 429, 503) with its reason, in the
+    log as well as in the answer: the access log line shows only the status.
+    "Still running" (409) and a failed audit (422) are answers, not refusals."""
+    print(f"{exc.status_code} for {access.client_key(request)} {request.method} {request.url.path}: {exc.detail}",
+          file=sys.stderr, flush=True)
+    return await http_exception_handler(request, exc)
 
 
 def fetched_suffix(item: Evidence) -> str:
@@ -177,6 +189,14 @@ def audit_answer(audit_id: str, request: Request) -> Any:
             "elapsed_seconds": round((job.get("finished_at") or time.time()) - (job.get("started_at") or 0), 1)
             if job.get("started_at") else None,
             **answer_body(result)}
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+def root() -> dict[str, str]:
+    """What this is and where to go: for a browser opening the address, a link
+    preview, or an uptime check - all of which got 404 here before."""
+    return {"service": "IDF audit", "health": "/api/health", "submit": "POST /api/audit",
+            "result": "GET /api/audit/{audit_id}"}
 
 
 @app.get("/api/health")

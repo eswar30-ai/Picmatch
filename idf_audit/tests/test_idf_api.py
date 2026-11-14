@@ -202,3 +202,11 @@ def test_a_restart_queues_waiting_audits_again_and_fails_the_running_one(client,
     assert wait(client, waiting).status_code == 200
     r = client.get(f"/api/audit/{running}")
     assert r.status_code == 422 and "restart" in r.json()["message"]
+
+
+def test_the_root_says_what_this_is_for_a_browser_or_an_uptime_check(client):
+    from fastapi.testclient import TestClient
+    from idf.app import app
+    plain = TestClient(app)                     # no key: it carries no audit data
+    assert plain.get("/").status_code == 200 and plain.get("/").json()["service"] == "IDF audit"
+    assert plain.head("/").status_code == 200

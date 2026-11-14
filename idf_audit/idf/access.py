@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import hmac
-import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -44,9 +43,7 @@ def has_key(request: Request) -> bool:
 def require(request: Request) -> None:
     if is_open() or has_key(request):
         return
-    print(f"401 for {client_key(request)} {request.method} {request.url.path}: no valid X-API-Key",
-          file=sys.stderr, flush=True)
-    raise HTTPException(401, "Send a valid X-API-Key header.")
+    raise HTTPException(401, "Send a valid X-API-Key header.")      # app.refused logs it
 
 
 def caller_of(request: Request) -> str:

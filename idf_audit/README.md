@@ -23,15 +23,15 @@ You need Python 3.10 and Ollama serving `qwen2.5vl:7b`.
 py -3.10 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 copy .env.example .env              :: then set OPEN_AUDIT_API or IDF_AUDIT_API_KEYS
-python run.py                       :: prints http://<this machine's IP>:8090
+python run.py                       :: prints http://<this machine's IP>:5008
 ```
 
-`python run.py --port 8091` for another port, `--host 127.0.0.1` for this
+`python run.py --port 5009` for another port, `--host 127.0.0.1` for this
 machine only. Windows Firewall must let the port in for IDF's server to reach it
 (once, as administrator):
 
 ```powershell
-New-NetFirewallRule -DisplayName "IDF audit 8090" -Direction Inbound -Protocol TCP -LocalPort 8090 -Action Allow
+New-NetFirewallRule -DisplayName "IDF audit 5008" -Direction Inbound -Protocol TCP -LocalPort 5008 -Action Allow
 ```
 
 ## The API

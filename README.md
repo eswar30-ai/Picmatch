@@ -19,6 +19,56 @@ venv\Scripts\python app.py --host 0.0.0.0 --port 5001
 First start loads both ONNX models and reads `data/index.npz`; photos whose
 file hasn't changed are reused, so it comes up in seconds.
 
+`app.py` also starts the IDF audit service from `idf_audit/` on port 5008
+(`--idf-port` for another, `--no-idf` for Picmatch alone), in IDF's own
+environment, and stops it when Picmatch stops. If something already listens on
+that port, it is left alone and used as is.
+
+## Picmatch and IDF on one domain
+
+`run.py` starts Picmatch (port 5001) and the IDF audit service in `idf_audit/`
+(port 5008) together, each in its own environment — `venv\` and
+`idf_audit\.venv\`, which can never be merged (`idf_audit/requirements.txt`).
+Both print to the same window, Ctrl+C stops both. Both listen on the server's
+localhost only, so nginx on the same server is the only way in from outside.
+
+```bat
+python run.py                              :: 127.0.0.1:5001 Picmatch + 127.0.0.1:5008 IDF
+python run.py --host 0.0.0.0               :: also reachable directly from other machines
+```
+
+Their paths don't overlap, so nginx sends IDF's three to 5008 and everything
+else to 5001, inside the existing `server { }` block for the domain:
+
+```nginx
+# IDF audit: POST /api/audit, GET /api/audit/{id}, GET /api/health
+location ^~ /api/audit {
+    proxy_pass http://127.0.0.1:5008;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 300m;      # a package's evidence files, up to 50 MB each
+    proxy_read_timeout 300s;
+}
+location = /api/health {
+    proxy_pass http://127.0.0.1:5008;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+}
+
+# Picmatch: everything else (already there)
+location / {
+    proxy_pass http://127.0.0.1:5001;
+    ...
+}
+```
+
+IDF's per-caller rate limit uses the address in `X-Forwarded-For` only when the
+request comes from 127.0.0.1 (uvicorn's default). If nginx runs on another
+machine, start with `FORWARDED_ALLOW_IPS=<nginx's IP>` set, or every caller
+shares one limit. On a public domain, keep `OPEN_AUDIT_API=false` and give IDF's
+backend a key from `IDF_AUDIT_API_KEYS` (`idf_audit/.env`).
+
 ## What changed and why it helps
 
 | | before (CPU) | now (GPU) |

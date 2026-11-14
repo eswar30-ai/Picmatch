@@ -229,3 +229,53 @@ def test_files_are_read_by_their_full_path(tmp_path, monkeypatch):
     audit.run(p, {39: Path("gym.jpg"), 40: Path("posters.jpg"), 42: Path("policy.pdf")},
               read_photo=reader, read_document=reader)
     assert all(path.is_absolute() for path in seen) and seen[0] == tmp_path / "gym.jpg"
+
+
+def test_the_real_readers_read_each_files_text_ahead_and_judge_in_order(tmp_path, monkeypatch):
+    """Text is read by the worker, the model is asked in the main thread, one
+    file at a time and in the package's order - and the result is the one the
+    readers give on their own."""
+    import threading
+
+    from idf import evidence
+    p = package.parse(CERTIFICATION)
+    files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
+    for f in files.values():
+        f.write_bytes(b"x")
+    texts = {"gym.jpg": "FITNESS CENTER", "posters.jpg": "TAKE THE STAIRS", "policy.pdf": " ".join(["policy"] * 30)}
+    main, text_threads, asked = threading.current_thread(), set(), []
+
+    def photo_text(path):
+        text_threads.add(threading.current_thread())
+        return [texts[path.name]]
+
+    def document_text(path):
+        text_threads.add(threading.current_thread())
+        return texts[path.name]
+
+    def ask(prompt, image=None):
+        assert threading.current_thread() is main
+        asked.append(next(name for name, text in texts.items() if text in prompt))
+        return '{"shows": "yes", "confidence": 0.9, "reason": "r", "description": "d", "text_seen": []}'
+
+    monkeypatch.setattr(evidence, "photo_text", photo_text)
+    monkeypatch.setattr(evidence, "document_text", document_text)
+    monkeypatch.setattr(evidence, "ask", ask)
+    result = audit.run(p, files)
+    assert asked == ["gym.jpg", "posters.jpg", "policy.pdf"]
+    assert main not in text_threads and len(text_threads) == 1
+    assert [e["text"] for e in result["evidence"]] == [["FITNESS CENTER"], ["TAKE THE STAIRS"], [texts["policy.pdf"]]]
+
+
+def test_a_model_that_does_not_answer_still_fails_the_audit_with_text_read_ahead(tmp_path, monkeypatch):
+    from idf import evidence
+    p = package.parse(CERTIFICATION)
+    files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
+    monkeypatch.setattr(evidence, "photo_text", lambda path: ["WORDS"])
+    monkeypatch.setattr(evidence, "document_text", lambda path: "words " * 30)
+
+    def down(prompt, image=None):
+        raise ModelDidNotAnswer("down")
+    monkeypatch.setattr(evidence, "ask", down)
+    with pytest.raises(ModelDidNotAnswer):
+        audit.run(p, files)

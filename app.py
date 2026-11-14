@@ -1195,6 +1195,10 @@ def parse_args(argv=None):
                         help="Port to listen on (default: 5001)")
     parser.add_argument("--no-gallery-sync", action="store_true",
                         help="Disable automatic background gallery sync")
+    parser.add_argument("--idf-port", type=int, default=int(os.environ.get("IDF_PORT", 5008)),
+                        help="Port for the IDF audit service started alongside (default: 5008)")
+    parser.add_argument("--no-idf", action="store_true",
+                        help="Do not start the IDF audit service (idf_audit/) alongside Picmatch")
     args = parser.parse_args(argv)
 
     try:
@@ -1202,14 +1206,47 @@ def parse_args(argv=None):
     except ValueError:
         parser.error(f"Invalid host address: {args.host}")
 
-    if not (1 <= args.port <= 65535):
+    if not (1 <= args.port <= 65535 and 1 <= args.idf_port <= 65535):
         parser.error("Port must be between 1 and 65535")
+    if not args.no_idf and args.idf_port == args.port:
+        parser.error("Picmatch and IDF need different ports")
 
     return args
 
 
+def start_idf(host, port):
+    """Start the IDF audit service (idf_audit/) beside Picmatch, in its own
+    environment - the two can never share one (idf_audit/requirements.txt).
+    Returns the running service, or None when it is not started here."""
+    if os.environ.get("PICMATCH_START_IDF") == "0":       # run.py starts it itself
+        return None
+    import run as launcher
+
+    if launcher.port_taken(port):
+        print(f"IDF audit: port {port} is already in use - using what is running there, not starting another.")
+        return None
+    python = launcher.ROOT / "idf_audit" / ".venv" / launcher.PYTHON
+    if not python.is_file():
+        print(f"IDF audit: not started - no environment at {python.parent.parent} (see idf_audit/README.md).")
+        return None
+    service = launcher.Service("idf", python, ["run.py", "--host", host, "--port", str(port)],
+                               launcher.ROOT / "idf_audit")
+    service.start()
+    print(f"IDF audit: its log is {launcher.LOGS}\\idf-<date>.log")
+    return service
+
+
 def main(argv=None):
     args = parse_args(argv)
+    idf = None if args.no_idf else start_idf(args.host, args.idf_port)
+    try:
+        serve(args, idf)
+    finally:
+        if idf is not None:
+            idf.stop(wait=15)        # Ctrl+C reaches it too; this waits for it to finish
+
+
+def serve(args, idf):
 
     print("Loading models and initializing index ...")
     print(settings_summary())
@@ -1230,6 +1267,8 @@ def main(argv=None):
 
     print(f"\nOpen this address in your browser: http://{args.host}:{args.port}\n")
     print(f"Endpoints: Web UI: http://{args.host}:{args.port}/ | Gallery: http://{args.host}:{args.port}/gallery | Docs: http://{args.host}:{args.port}/docs\n")
+    if idf is not None:
+        print(f"IDF audit: http://{args.host}:{args.idf_port}/api/health | POST http://{args.host}:{args.idf_port}/api/audit\n")
     app.run(debug=False, port=args.port, host=args.host)
 
 
