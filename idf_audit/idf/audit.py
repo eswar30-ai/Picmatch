@@ -8,6 +8,7 @@ built from a photo the model never judged.
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -99,11 +100,30 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
         raise ValueError(f"no file was received for evidence {', '.join(map(str, missing))}")
     reads: dict[int, dict[str, Any]] = {}
     findings: dict[int, dict[str, Any] | None] = {}
-    for item in package.evidence:
-        reader = read_photo if item.kind == "photo" else read_document
-        reads[item.id] = reader(files[item.id], claim_for(package, item))
-        findings[item.id] = (location.check(item, location.exif_of(files[item.id]), peers=package.photos)
-                             if item.kind == "photo" else None)
+    # The text of every file is read in order by one worker (CPU), so the next
+    # file's text is ready while the model (GPU) judges this one: the audit
+    # takes the model's time plus one file's OCR, not both added up per file.
+    # Only for the real readers - one passed in (a test's) reads its own way.
+    ahead = ThreadPoolExecutor(max_workers=1, thread_name_prefix="idf-text")
+    try:
+        texts: dict[int, Future] = {}
+        for item in package.evidence:
+            if item.kind == "photo" and read_photo is evidence.read_photo:
+                texts[item.id] = ahead.submit(evidence.photo_text, files[item.id])
+            elif item.kind != "photo" and read_document is evidence.read_document:
+                texts[item.id] = ahead.submit(evidence.document_text, files[item.id])
+        for item in package.evidence:
+            path, claim = files[item.id], claim_for(package, item)
+            if item.id not in texts:
+                reads[item.id] = (read_photo if item.kind == "photo" else read_document)(path, claim)
+            elif item.kind == "photo":
+                reads[item.id] = evidence.read_photo(path, claim, ocr_lines=texts[item.id].result())
+            else:
+                reads[item.id] = evidence.read_document(path, claim, text=texts[item.id].result())
+            findings[item.id] = (location.check(item, location.exif_of(path), peers=package.photos)
+                                 if item.kind == "photo" else None)
+    finally:
+        ahead.shutdown(wait=False, cancel_futures=True)     # a failed audit does not wait for text it will not use
     same = same_files(files)
 
     if package.target_type == "certification":

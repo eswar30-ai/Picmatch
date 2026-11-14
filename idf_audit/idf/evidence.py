@@ -131,9 +131,17 @@ def ask(prompt: str, image: Path | None = None) -> str:
         raise ModelDidNotAnswer("Ollama's answer had no message in it; submit the audit again.") from exc
 
 
-def read_photo(path: Path, claim: str) -> dict[str, Any]:
-    """The verdict on one photo: text by RapidOCR, the judgement by the model."""
-    ocr_lines = [line.strip() for line in page_text([path]).splitlines() if line.strip()]
+def photo_text(path: Path) -> list[str]:
+    """The words RapidOCR reads in a photo, one per line."""
+    return [line.strip() for line in page_text([path]).splitlines() if line.strip()]
+
+
+def read_photo(path: Path, claim: str, ocr_lines: list[str] | None = None) -> dict[str, Any]:
+    """The verdict on one photo: text by RapidOCR, the judgement by the model.
+    `ocr_lines`, when given, is `photo_text(path)` already read (audit.run reads
+    the next file's text while the model judges this one)."""
+    if ocr_lines is None:
+        ocr_lines = photo_text(path)
     answer = ask(photo_prompt(claim, ocr_lines), image=path)
     parsed = parse(answer)
     return {
@@ -169,10 +177,12 @@ def document_text(path: Path) -> str:
     return page_text([path])[:DOCUMENT_CHARS]
 
 
-def read_document(path: Path, claim: str) -> dict[str, Any]:
+def read_document(path: Path, claim: str, text: str | None = None) -> dict[str, Any]:
     """The verdict on one document from its text. Too little text to judge is
-    `unsure` without a model call: the model cannot read what OCR did not."""
-    text = document_text(path)
+    `unsure` without a model call: the model cannot read what OCR did not.
+    `text`, when given, is `document_text(path)` already read."""
+    if text is None:
+        text = document_text(path)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(re.findall(r"\w{2,}", text)) < DOCUMENT_MIN_WORDS:
         return {"kind": "document", "shows": "unsure", "confidence": 0.0,
