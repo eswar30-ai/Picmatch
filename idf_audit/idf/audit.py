@@ -1,0 +1,149 @@
+"""One audit: a Package and its files in, the verdict out.
+
+`run` is the whole judgement and is pure apart from the two readers it is
+given: the API's job calls it with the real ones, tests with fakes. A reader that raises `ModelDidNotAnswer` fails the audit: no verdict is
+built from a photo the model never judged.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Any, Callable
+
+from idf import checks, evidence, location
+from idf.package import Evidence, Package
+
+Reader = Callable[[Path, str], dict[str, Any]]
+
+#: Keys of the stored result that go back to IDF: their callback body, no more.
+CALLBACK_KEYS = ("status", "score", "comments", "checks")
+#: Longest `ai_note`, in characters: one line for the reviewer beside the file.
+NOTE_MAX = 300
+
+
+def claim_for(package: Package, item: Evidence) -> str:
+    """What this file is meant to show, in words the model is asked to verify."""
+    if package.target_type == "certification":
+        what = f'the requirement "{item.title}"' if item.title else "the application"
+        return (f"This {item.kind} was uploaded as evidence for {what} of a certification application "
+                f'by the institution "{package.name}" (category: {package.category or "not given"}), '
+                f"located at {package.address or 'an address not given'}."
+                + (" It should show a safe place where people can exercise." if "exercise" in item.title.lower() else "")
+                + (" It should show signage, posters or boards promoting physical activity." if "signage" in item.title.lower() else "")
+                + (" It should be a written policy promoting physical activity at this institution." if item.kind == "document" and "policy" in item.title.lower() else ""))
+    when = f" from {package.dates[0]} to {package.dates[1]}" if package.dates else ""
+    who = f' organised by "{package.organizer}"' if package.organizer else ""
+    return (f'This {item.kind} was uploaded as supporting material for the program "{package.name}" '
+            f'({package.category or "program"}){who}{when} at {package.address or "a venue not given"}. '
+            f"The program describes itself as: {package.description or 'no description given'}. "
+            f"It should show the venue, the activities or the promotion of this program.")
+
+
+def comments_for(package: Package, result_checks: list[dict[str, Any]], reads: dict[int, dict[str, Any]]) -> str:
+    """One line for the reviewer's list."""
+    final = result_checks[-1]
+    shown = sum(1 for r in reads.values() if checks.evidence_status(r)[0] == "approved")
+    head = f"{shown} of {len(reads)} evidence file(s) show what they were uploaded for"
+    if final["status"] == "approved":
+        return f"{head}; every check passed."
+    rejected = [c["check_type"] for c in result_checks[:-1] if c["status"] == "rejected"]
+    pending = [c["check_type"] for c in result_checks[:-1] if c["status"] == "changes_required"]
+    parts = ([f"rejected on {', '.join(rejected)}"] if rejected else []) + \
+            ([f"changes required on {', '.join(pending)}"] if pending else [])
+    return f"{head}; {'; '.join(parts)}."
+
+
+def same_files(files: dict[int, Path]) -> dict[int, list[int]]:
+    """Evidence ids whose files are byte for byte the same, each against the
+    others: `{43: [45], 45: [43]}`. One photo uploaded for two requirements
+    cannot be evidence for both."""
+    by_hash: dict[str, list[int]] = {}
+    for eid, path in files.items():
+        by_hash.setdefault(hashlib.sha256(path.read_bytes()).hexdigest(), []).append(eid)
+    return {eid: [o for o in group if o != eid] for group in by_hash.values() if len(group) > 1 for eid in group}
+
+
+def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
+                 same_as: list[str] | None = None) -> tuple[str, str]:
+    """One file's `ai_status` and `ai_note`, for IDF's evidence record: what the
+    file shows and, for a photo whose position is checked, where it was taken,
+    together. The worse of the two decides: the right picture taken 5 km from the
+    declared place is not approved. A file also uploaded for another requirement
+    (`same_as`, their titles) is at best `changes_required`."""
+    status, _ = checks.evidence_status(read)
+    reason = (read.get("reason") or "").strip()
+    if status == "approved":
+        note = reason or "Shows what it was uploaded for."
+    elif status == "rejected":
+        note = f"Does not show it: {reason or 'the model saw something else'}"
+    else:
+        note = f"Cannot be told from the file: {reason or 'no clear answer'}"
+    if finding:
+        status = checks.worst([status, finding["status"]])
+        if finding["status"] != "approved":
+            note = f"{note.rstrip('.')}. Location: {finding['details']}"
+    if same_as:
+        status = checks.worst([status, "changes_required"])
+        note = f"The same file was also uploaded for {', '.join(same_as)}. {note}"
+    if len(note) > NOTE_MAX:
+        note = note[:NOTE_MAX - 3].rstrip() + "..."
+    return status, note
+
+
+def run(package: Package, files: dict[int, Path], *, read_photo: Reader = evidence.read_photo,
+        read_document: Reader = evidence.read_document) -> dict[str, Any]:
+    files = {eid: Path(path).resolve() for eid, path in files.items()}   # full paths, whatever folder the caller ran from
+    missing = [e.id for e in package.evidence if e.id not in files]
+    if missing:
+        raise ValueError(f"no file was received for evidence {', '.join(map(str, missing))}")
+    reads: dict[int, dict[str, Any]] = {}
+    findings: dict[int, dict[str, Any] | None] = {}
+    for item in package.evidence:
+        reader = read_photo if item.kind == "photo" else read_document
+        reads[item.id] = reader(files[item.id], claim_for(package, item))
+        findings[item.id] = (location.check(item, location.exif_of(files[item.id]), peers=package.photos)
+                             if item.kind == "photo" else None)
+    same = same_files(files)
+
+    if package.target_type == "certification":
+        result_checks = checks.certification_checks(package, reads, findings, same)
+    else:
+        result_checks = checks.program_checks(package, reads, same)
+    final = result_checks[-1]
+    items = []
+    for item in package.evidence:
+        read = reads[item.id]
+        status, score = checks.evidence_status(read)
+        twins = [e for e in package.evidence if e.id in same.get(item.id, [])]
+        ai_status, ai_note = file_verdict(read, findings.get(item.id), [checks.label(e) for e in twins])
+        items.append({"id": item.id, "title": item.title, "kind": item.kind, "name": item.name,
+                      "ai_status": ai_status, "ai_note": ai_note, "same_file_as": [e.id for e in twins],
+                      "status": status, "score": score, "shows": read["shows"],
+                      "confidence": read["confidence"], "reason": read["reason"],
+                      "description": read["description"], "text": read["text"],
+                      "location": findings.get(item.id)})
+    return {
+        "target_type": package.target_type, package.id_key: package.target_id, "number": package.number,
+        "status": final["status"], "score": final["score"],
+        "comments": comments_for(package, result_checks, reads),
+        "checks": result_checks,
+        "evidence": items,
+        "claims": checks.claims(package, reads) if package.target_type == "certification" else [],
+        "model_answers": {str(e.id): reads[e.id].get("model_answer") for e in package.evidence},
+    }
+
+
+def callback_body(result: dict[str, Any]) -> dict[str, Any]:
+    """Their callback body: the verdict, the four checks, and one line per file
+    for the `ai_status` / `ai_note` of their evidence records."""
+    body = {key: result[key] for key in CALLBACK_KEYS}
+    body["evidence"] = [{"id": e["id"], "ai_status": e["ai_status"], "ai_note": e["ai_note"]}
+                        for e in result["evidence"]]
+    return body
+
+
+def answer_body(result: dict[str, Any]) -> dict[str, Any]:
+    """What our own GET returns: the callback body plus the per-file detail;
+    never the model's raw answers, which stay server-side."""
+    return {key: value for key, value in result.items() if key != "model_answers"}
