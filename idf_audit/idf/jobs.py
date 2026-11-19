@@ -30,6 +30,13 @@ _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="idf-audit")
 UNFINISHED = ("QUEUED", "PROCESSING")
 
 
+def finished_state(status: str) -> str:
+    """A finished audit's state, from its verdict: ACCEPTED or REJECTED - the
+    same two outcomes as `status`. (Before 2026-11-19 a rejection was
+    NEEDS_REVIEW, which their app showed as "in review".)"""
+    return "ACCEPTED" if status == "approved" else "REJECTED"
+
+
 def new_job_id() -> str:
     return f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
@@ -124,7 +131,7 @@ def run_job(job_id: str, folder: Path) -> None:
         target.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
         result["callback"] = callback.post(package.callback_url, callback_body(result))
         target.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
-        state = "ACCEPTED" if result["status"] == "approved" else "NEEDS_REVIEW"
+        state = finished_state(result["status"])
         mark(state=state, finished_at=time.time(),
              message=f"{result['status'].replace('_', ' ')}, score {result['score']}: {result['comments']}")
         with JOBS_LOCK:

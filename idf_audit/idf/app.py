@@ -185,6 +185,9 @@ def audit_answer(audit_id: str, request: Request) -> Any:
     if not path.is_file():
         raise HTTPException(404, "The verdict is no longer on disk")
     result = json.loads(path.read_text(encoding="utf-8"))
+    # From the verdict, not the stored state: an audit finished before the rename
+    # was saved as NEEDS_REVIEW, and is fetched again as REJECTED.
+    state = jobs.finished_state(result["status"])
     return {"audit_id": audit_id, "state": state,
             "elapsed_seconds": round((job.get("finished_at") or time.time()) - (job.get("started_at") or 0), 1)
             if job.get("started_at") else None,
