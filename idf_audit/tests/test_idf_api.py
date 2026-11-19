@@ -33,8 +33,8 @@ def judged(monkeypatch):
     def fake_run(package, paths):
         seen["names"] = {i: p.name for i, p in paths.items()}
         return {"target_type": "certification", "application_id": package.target_id, "number": package.number,
-                "status": "changes_required", "score": 61, "comments": "c",
-                "checks": [{"check_type": "overall", "status": "changes_required", "score": 61, "details": "d"}],
+                "status": "rejected", "score": 61, "comments": "c",
+                "checks": [{"check_type": "overall", "status": "rejected", "score": 61, "details": "d"}],
                 "evidence": [], "claims": [], "model_answers": {"39": "{...}"}}
     monkeypatch.setattr(idf_audit, "run", fake_run)
     monkeypatch.setattr("idf.callback.post", lambda url, body: {"posted": False, "status": None, "detail": "off"})
@@ -76,13 +76,13 @@ def test_an_audit_is_queued_judged_and_fetched(client, judged):
     r = wait(client, audit_id)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["state"] == "NEEDS_REVIEW" and body["status"] == "changes_required" and body["score"] == 61
+    assert body["state"] == "REJECTED" and body["status"] == "rejected" and body["score"] == 61
     assert body["application_id"] == 26 and "model_answers" not in body and body["callback"]["posted"] is False
     assert body["elapsed_seconds"] is not None
     assert judged["names"] == {39: "39_gym.jpg", 40: "40_posters.jpg", 42: "42_policy.pdf"}
     stored = json.loads((settings.UPLOADS / audit_id / "package.json").read_text(encoding="utf-8"))
     assert "contact_email" not in stored["data"]["institution"] and stored["data"]["institution"]["name"]
-    assert json.loads((settings.JOBS / f"{audit_id}.json").read_text(encoding="utf-8"))["state"] == "NEEDS_REVIEW"
+    assert json.loads((settings.JOBS / f"{audit_id}.json").read_text(encoding="utf-8"))["state"] == "REJECTED"
 
 
 def test_what_cannot_be_audited_is_refused_with_the_reason(client):
@@ -210,3 +210,19 @@ def test_the_root_says_what_this_is_for_a_browser_or_an_uptime_check(client):
     plain = TestClient(app)                     # no key: it carries no audit data
     assert plain.get("/").status_code == 200 and plain.get("/").json()["service"] == "IDF audit"
     assert plain.head("/").status_code == 200
+
+
+def test_a_finished_audit_reads_accepted_or_rejected_even_if_saved_as_needs_review(client, judged):
+    """Audits finished before 2026-11-19 were saved as NEEDS_REVIEW, which their app
+    showed as "in review"; fetched now, the state follows the verdict."""
+    from idf import settings
+    r = client.post("/api/audit", data={"package": json.dumps(CERTIFICATION)}, files=files())
+    audit_id = r.json()["audit_id"]
+    assert wait(client, audit_id).status_code == 200
+    job_file = settings.JOBS / f"{audit_id}.json"
+    job = json.loads(job_file.read_text(encoding="utf-8"))
+    job_file.write_text(json.dumps({**job, "state": "NEEDS_REVIEW"}), encoding="utf-8")
+    from idf import jobs
+    with jobs.JOBS_LOCK:
+        jobs.JOBS.pop(audit_id, None)
+    assert client.get(f"/api/audit/{audit_id}").json()["state"] == "REJECTED"
