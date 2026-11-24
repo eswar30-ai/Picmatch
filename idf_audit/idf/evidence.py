@@ -28,9 +28,11 @@ from idf.ocr import ModelDidNotAnswer, page_text, pdf_text
 from idf.helpers import _as_json, _confidence, _photo_for_model, reconcile
 
 VERDICTS = ("yes", "no", "unsure")
-#: Pages of a document read, and the most of its text given to the model.
-DOCUMENT_PAGES = 3
-DOCUMENT_CHARS = 6000
+#: Pages of a document read, and the most of its text given to the model
+#: (about 4 characters a token: 20000 is some 5000 tokens, well inside num_ctx).
+#: More is a longer model call, and on a CPU it can reach OLLAMA_TIMEOUT.
+DOCUMENT_PAGES = settings.number("DOCUMENT_PAGES", 10)
+DOCUMENT_CHARS = settings.number("DOCUMENT_CHARS", 20000)
 #: Fewer words than this and a document is not judged: there is nothing to judge.
 DOCUMENT_MIN_WORDS = 20
 
@@ -108,7 +110,7 @@ def ask(prompt: str, image: Path | None = None) -> str:
     """One model call; the message, or `ModelDidNotAnswer`."""
     base = settings.value("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     model = settings.value("OLLAMA_MODEL", "qwen2.5vl:7b")
-    timeout = settings.number("OLLAMA_TIMEOUT", 180)
+    timeout = settings.number("OLLAMA_TIMEOUT", 300)
     message: dict[str, Any] = {"role": "user", "content": prompt}
     if image is not None:
         message["images"] = [_photo_for_model(image)]
