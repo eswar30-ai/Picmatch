@@ -2,17 +2,23 @@
 
 `run` is the whole judgement and is pure apart from the two readers it is
 given: the API's job calls it with the real ones, tests with fakes. A reader that raises `ModelDidNotAnswer` fails the audit: no verdict is
-built from a photo the model never judged.
+built from a photo the model never judged. A file that cannot be read - a
+broken image, a damaged PDF - fails only itself: it is judged "could not be
+read", and the rest of the audit goes on.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sys
+import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 from idf import checks, evidence, location
+from idf.ocr import ModelDidNotAnswer
 from idf.package import Evidence, Package
 
 Reader = Callable[[Path, str], dict[str, Any]]
@@ -99,12 +105,33 @@ def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
     return status, note, score
 
 
+def kinds_from_files(package: Package, files: dict[int, Path]) -> Package:
+    """The package with every PDF a document, whatever it was labelled: IDF's
+    backend has sent PDFs as photos (`image/...`), and a PDF read as a photo
+    cannot be opened (2026-11-24, audits 1795516313_3b3c0790 and
+    1795516895_03f1e4ce). Only that way round: an image labelled a document -
+    a photographed policy - is read as a document on purpose, its text by OCR."""
+    fixed = tuple(replace(e, kind="document") if e.kind != "document" and files[e.id].suffix.lower() == ".pdf"
+                  else e for e in package.evidence)
+    return package if fixed == package.evidence else replace(package, evidence=fixed)
+
+
+def unreadable(item: Evidence, exc: BaseException) -> dict[str, Any]:
+    """The reading of a file that could not be opened: not judged, so `unsure`
+    with nothing behind it (`parsed: False`, a score of 20) - decided by score
+    like any file that cannot be told, and saying why."""
+    return {"kind": item.kind, "shows": "unsure", "confidence": 0.0,
+            "reason": f"the file could not be read ({type(exc).__name__}), so it was not judged",
+            "description": "", "text": [], "parsed": False, "model_answer": None}
+
+
 def run(package: Package, files: dict[int, Path], *, read_photo: Reader = evidence.read_photo,
         read_document: Reader = evidence.read_document) -> dict[str, Any]:
     files = {eid: Path(path).resolve() for eid, path in files.items()}   # full paths, whatever folder the caller ran from
     missing = [e.id for e in package.evidence if e.id not in files]
     if missing:
         raise ValueError(f"no file was received for evidence {', '.join(map(str, missing))}")
+    package = kinds_from_files(package, files)
     reads: dict[int, dict[str, Any]] = {}
     findings: dict[int, dict[str, Any] | None] = {}
     # The text of every file is read in order by one worker (CPU), so the next
@@ -121,12 +148,20 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
                 texts[item.id] = ahead.submit(evidence.document_text, files[item.id])
         for item in package.evidence:
             path, claim = files[item.id], claim_for(package, item)
-            if item.id not in texts:
-                reads[item.id] = (read_photo if item.kind == "photo" else read_document)(path, claim)
-            elif item.kind == "photo":
-                reads[item.id] = evidence.read_photo(path, claim, ocr_lines=texts[item.id].result())
-            else:
-                reads[item.id] = evidence.read_document(path, claim, text=texts[item.id].result())
+            try:
+                if item.id not in texts:
+                    reads[item.id] = (read_photo if item.kind == "photo" else read_document)(path, claim)
+                elif item.kind == "photo":
+                    reads[item.id] = evidence.read_photo(path, claim, ocr_lines=texts[item.id].result())
+                else:
+                    reads[item.id] = evidence.read_document(path, claim, text=texts[item.id].result())
+            except ModelDidNotAnswer:
+                raise                                   # the model, not the file: the audit fails
+            except Exception as exc:                    # noqa: BLE001 - this file only
+                print(f"evidence {item.id} ({path.name}) could not be read: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+                traceback.print_exc()
+                reads[item.id] = unreadable(item, exc)
             findings[item.id] = (location.check(item, location.exif_of(path), peers=package.photos)
                                  if item.kind == "photo" else None)
     finally:
