@@ -311,6 +311,103 @@ def test_the_threshold_moves_the_line(tmp_path, monkeypatch):
     assert checks.decide("changes_required", 86) == "rejected"
 
 
+def pdf_labelled_a_photo():
+    """CERTIFICATION with its policy PDF sent as IDF's backend sent it on 2026-11-24: a photo."""
+    data = {**CERTIFICATION["data"], "evidence_files": [
+        e if e["id"] != 42 else {**e, "kind": "photo", "mime_type": "image/jpeg"}
+        for e in CERTIFICATION["data"]["evidence_files"]]}
+    p = package.parse(data)
+    assert next(e for e in p.evidence if e.id == 42).kind == "photo"
+    return p
+
+
+def three_files(tmp_path):
+    files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
+    for name, f in files.items():
+        f.write_bytes(str(name).encode())
+    return files
+
+
+def test_a_pdf_labelled_a_photo_is_read_as_a_document(tmp_path):
+    p, files = pdf_labelled_a_photo(), three_files(tmp_path)
+    photos, documents = [], []
+
+    def read_photo(path, claim):
+        photos.append(path.name)
+        return read("yes", 0.95)
+
+    def read_document(path, claim):
+        documents.append(path.name)
+        return {**read("yes", 0.9), "kind": "document"}
+    result = audit.run(p, files, read_photo=read_photo, read_document=read_document)
+    assert photos == ["gym.jpg", "posters.jpg"] and documents == ["policy.pdf"]
+    policy = next(e for e in result["evidence"] if e["id"] == 42)
+    assert policy["kind"] == "document" and policy["location"] is None and policy["status"] == "approved"
+
+
+def test_a_pdf_labelled_a_photo_reaches_the_real_document_reader(tmp_path, monkeypatch):
+    # The failure as it happened: the read-ahead OCR'd the PDF as an image.
+    from idf import evidence
+    p, files = pdf_labelled_a_photo(), three_files(tmp_path)
+
+    def photo_text(path):
+        assert path.suffix != ".pdf", "a PDF was read as a photo"
+        return ["WORDS"]
+    monkeypatch.setattr(evidence, "photo_text", photo_text)
+    monkeypatch.setattr(evidence, "document_text", lambda path: "policy " * 30)
+    monkeypatch.setattr(evidence, "ask", lambda prompt, image=None:
+                        '{"shows": "yes", "confidence": 0.9, "reason": "r", "description": "d", "text_seen": []}')
+    result = audit.run(p, files)
+    assert [e["kind"] for e in result["evidence"]] == ["photo", "photo", "document"]
+
+
+def test_an_image_labelled_a_document_stays_a_document(tmp_path):
+    # A photographed policy is read for its text on purpose.
+    data = {**CERTIFICATION["data"], "evidence_files": [
+        e if e["id"] != 42 else {**e, "name": "policy.jpg"} for e in CERTIFICATION["data"]["evidence_files"]]}
+    p = package.parse(data)
+    files = {**three_files(tmp_path)}
+    files[42] = files[42].rename(tmp_path / "policy.jpg")
+    assert audit.kinds_from_files(p, files) is p
+
+
+def test_a_file_that_cannot_be_read_fails_only_itself(tmp_path):
+    p, files = package.parse(CERTIFICATION), three_files(tmp_path)
+
+    def read_photo(path, claim):
+        if path.name == "gym.jpg":
+            raise OSError("cannot identify image file")
+        return read("yes", 0.95)
+    result = audit.run(p, files, read_photo=read_photo,
+                       read_document=lambda path, claim: {**read("yes", 0.9), "kind": "document"})
+    assert_two_outcomes(result)
+    gym = next(e for e in result["evidence"] if e["id"] == 39)
+    assert gym["ai_status"] == "rejected" and gym["score"] == 20
+    assert "could not be read (OSError)" in gym["ai_note"] and gym["shows"] == "unsure"
+    assert [e["status"] for e in result["evidence"] if e["id"] != 39] == ["approved", "approved"]
+
+
+def test_text_that_cannot_be_read_ahead_fails_only_its_file(tmp_path, monkeypatch):
+    from idf import evidence
+    p, files = package.parse(CERTIFICATION), three_files(tmp_path)
+
+    class LoadImageError(Exception):
+        pass
+
+    def photo_text(path):
+        if path.name == "gym.jpg":
+            raise LoadImageError("cannot identify image file")
+        return ["WORDS"]
+    monkeypatch.setattr(evidence, "photo_text", photo_text)
+    monkeypatch.setattr(evidence, "document_text", lambda path: "policy " * 30)
+    monkeypatch.setattr(evidence, "ask", lambda prompt, image=None:
+                        '{"shows": "yes", "confidence": 0.9, "reason": "r", "description": "d", "text_seen": []}')
+    result = audit.run(p, files)
+    by_id = {e["id"]: e for e in result["evidence"]}
+    assert "could not be read (LoadImageError)" in by_id[39]["ai_note"]
+    assert by_id[40]["status"] == by_id[42]["status"] == "approved"
+
+
 def test_an_unsure_photo_never_comes_back_as_changes_required(tmp_path):
     p = package.parse(CERTIFICATION)
     files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
