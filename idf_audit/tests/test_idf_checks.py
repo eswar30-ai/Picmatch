@@ -408,6 +408,20 @@ def test_text_that_cannot_be_read_ahead_fails_only_its_file(tmp_path, monkeypatc
     assert by_id[40]["status"] == by_id[42]["status"] == "approved"
 
 
+def test_a_document_is_read_to_ten_pages_and_twenty_thousand_characters(tmp_path, monkeypatch):
+    from idf import evidence
+    asked = []
+
+    def pdf_text(path, pages):
+        asked.append(pages)
+        return "policy words " * 5000                              # 65000 characters
+    monkeypatch.setattr(evidence, "pdf_text", pdf_text)
+    pdf = tmp_path / "policy.pdf"
+    pdf.write_bytes(b"%PDF-")
+    text = evidence.document_text(pdf)
+    assert asked == [10] and len(text) == 20000
+
+
 def test_an_unsure_photo_never_comes_back_as_changes_required(tmp_path):
     p = package.parse(CERTIFICATION)
     files = {39: tmp_path / "gym.jpg", 40: tmp_path / "posters.jpg", 42: tmp_path / "policy.pdf"}
