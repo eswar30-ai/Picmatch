@@ -226,3 +226,55 @@ def test_a_finished_audit_reads_accepted_or_rejected_even_if_saved_as_needs_revi
     with jobs.JOBS_LOCK:
         jobs.JOBS.pop(audit_id, None)
     assert client.get(f"/api/audit/{audit_id}").json()["state"] == "REJECTED"
+
+
+# --- the live demo page (DEMO_UI) ------------------------------------------------
+
+def test_the_demo_page_does_not_exist_unless_turned_on(client, monkeypatch):
+    monkeypatch.delenv("DEMO_UI", raising=False)
+    for path in ("/demo", "/demo/config"):
+        assert client.get(path).status_code == 404
+    assert client.post("/demo/reset").status_code == 404
+
+
+def test_the_demo_page_its_settings_and_the_gps_of_a_photo(client, monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from idf_sample import gps_exif
+
+    monkeypatch.setenv("DEMO_UI", "true")
+    monkeypatch.setenv("AUTHENTICITY_CHECKS", "true")
+    page = client.get("/demo")
+    assert page.status_code == 200 and "IDF Audit Live Demo" in page.text and 'fetch("api/audit"' in page.text
+    config = client.get("/demo/config").json()
+    assert config["authenticity"] is True and config["site_radius_m"] == 300 and config["needs_key"] is True
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), "white").save(buf, "JPEG", exif=gps_exif(17.4435, 78.3772, "2026-11-25 09:00:00"))
+    exif = client.post("/demo/exif", files={"file": ("p.jpg", buf.getvalue(), "image/jpeg")}).json()
+    assert abs(exif["latitude"] - 17.4435) < 1e-4 and exif["taken_at"] == "2026-11-25 09:00:00"
+    assert client.post("/demo/exif", headers={"X-API-Key": "wrong"},
+                       files={"file": ("p.jpg", buf.getvalue(), "image/jpeg")}).status_code == 401
+
+
+def test_the_demo_can_forget_earlier_photos(client, monkeypatch, tmp_path):
+    from idf import fingerprints
+    monkeypatch.setenv("DEMO_UI", "true")
+    index = tmp_path / "fingerprints.jsonl"
+    index.write_text('{"hash": "0"}\n', encoding="utf-8")
+    monkeypatch.setattr(fingerprints, "index_file", lambda: index)
+    assert client.post("/demo/reset").json() == {"reset": True} and not index.exists()
+
+
+def test_the_demo_sample_photos_carry_no_gps(client, monkeypatch):
+    from idf import location
+    from idf.demo_samples import SAMPLES
+    monkeypatch.setenv("DEMO_UI", "true")
+    for name in SAMPLES:
+        reply = client.get(f"/demo/sample/{name}")
+        assert reply.status_code == 200 and reply.headers["content-type"] == "image/jpeg"
+        image = Image.open(io.BytesIO(reply.content))
+        assert image.size[0] >= 900 and not image.getexif()
+    assert client.get("/demo/sample/nothing").status_code == 404
+    assert location.exif_of  # the page reads GPS through /demo/exif, which finds none here

@@ -42,6 +42,8 @@ class Evidence:
     source: str = ""            # "camera" (taken in their app) or "upload" (picked from a file)
     url: str = ""               # the file's path on IDF's server, fetched when the file is not sent
     mime_type: str = ""
+    gps_accuracy_m: float | None = None     # how sure the phone was of its position, in metres
+    mock_location: bool = False             # the phone reported a fake-GPS (mock) position
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,13 @@ class Package:
     evidence: tuple[Evidence, ...] = ()
     callback_url: str | None = None
     submitted_at: str | None = None
+    site: tuple[float, float] | None = None     # the institution's (or venue's) own coordinates
+    site_source: str = ""                       # "pin" (marked on site or on a map) or "geocoded" (from the address)
+
+    @property
+    def owner(self) -> str:
+        """Who the evidence belongs to: one application or program, resubmitted or not."""
+        return f"{self.target_type}:{self.target_id}"
 
     @property
     def id_key(self) -> str:
@@ -104,6 +113,24 @@ def _number(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _flag(value: Any) -> bool:
+    """A yes/no their JSON may send as true, 1 or "true"."""
+    return value is True or value == 1 or str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _site(block: Any) -> tuple[tuple[float, float] | None, str]:
+    """The coordinates of an institution or venue, and how they were found
+    (`location_source`: "pin" unless it says "geocoded"). None for a missing,
+    zero or impossible position."""
+    if not isinstance(block, dict):
+        return None, ""
+    lat, lon = _number(block.get("latitude")), _number(block.get("longitude"))
+    if lat is None or lon is None or (lat, lon) == (0.0, 0.0) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None, ""
+    source = _text(block.get("location_source"), 20).lower()
+    return (lat, lon), ("geocoded" if source == "geocoded" else "pin")
 
 
 def _int(value: Any, what: str) -> int:
@@ -158,6 +185,8 @@ def _evidence(items: Any) -> tuple[Evidence, ...]:
             url=_path(item),
             mime_type=_text(item.get("mime_type")
                             or (item["file"].get("mime_type") if isinstance(item.get("file"), dict) else ""), 60).lower(),
+            gps_accuracy_m=_number(item.get("gps_accuracy_m")),
+            mock_location=_flag(item.get("mock_location")),
         ))
     if len({e.id for e in out}) != len(out):
         raise BadPackage("two evidence files share an id")
@@ -229,7 +258,9 @@ def parse(data: Any) -> Package:
         institution = data.get("institution") or {}
         if not isinstance(institution, dict) or not _text(institution.get("name")):
             raise BadPackage("a certification package needs institution.name")
+        site, site_source = _site(institution)
         return Package(
+            site=site, site_source=site_source,
             target_type=target,
             target_id=_int(data.get("application_id"), "application_id"),
             number=_text(data.get("application_no"), 60),
@@ -255,7 +286,9 @@ def parse(data: Any) -> Package:
     start = _text(dates.get("start_date") or data.get("start_date"), 20)
     end = _text(dates.get("end_date") or data.get("end_date"), 20)
     agenda = data.get("schedule") if isinstance(data.get("schedule"), list) else data.get("agenda")
+    site, site_source = _site(venue)
     return Package(
+        site=site, site_source=site_source,
         target_type=target,
         target_id=_int(data.get("program_id"), "program_id"),
         number=_text(data.get("program_no"), 60),

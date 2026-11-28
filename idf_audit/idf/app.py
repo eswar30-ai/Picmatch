@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -23,13 +24,13 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from idf import access, fetch, jobs, ocr, settings
-from idf.audit import answer_body
+from idf import access, fetch, jobs, location, ocr, settings
+from idf.audit import answer_body, authenticity_on
 from idf.package import BadPackage, Evidence, parse
 
 AUDIT_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".pdf"}
@@ -200,6 +201,69 @@ def root() -> dict[str, str]:
     preview, or an uptime check - all of which got 404 here before."""
     return {"service": "IDF audit", "health": "/api/health", "submit": "POST /api/audit",
             "result": "GET /api/audit/{audit_id}"}
+
+
+DEMO_PAGE = Path(__file__).with_name("demo.html")
+
+
+def _demo_on() -> None:
+    """The live demo page exists only where DEMO_UI is on: never in production."""
+    if not settings.enabled("DEMO_UI"):
+        raise HTTPException(404, "Not Found")
+
+
+@app.get("/demo", include_in_schema=False)
+def demo_page() -> HTMLResponse:
+    """A page to fill in an application, upload photos, send it to /api/audit
+    and show the answer: for showing the audit live."""
+    _demo_on()
+    return HTMLResponse(DEMO_PAGE.read_text(encoding="utf-8"))
+
+
+@app.get("/demo/config", include_in_schema=False)
+def demo_config() -> dict[str, Any]:
+    _demo_on()
+    return {"authenticity": authenticity_on(), "site_radius_m": location.SITE_RADIUS_M,
+            "geocoded_radius_m": location.GEOCODED_RADIUS_M, "needs_key": not access.is_open()}
+
+
+@app.post("/demo/exif", include_in_schema=False)
+async def demo_exif(request: Request) -> dict[str, Any]:
+    """Where and when a photo says it was taken, read from its file - shown as
+    soon as a photo is picked. The photo is not kept."""
+    _demo_on()
+    access.require(request)
+    form = await request.form()
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        raise HTTPException(400, "Send the photo as the form field `file`.")
+    with tempfile.TemporaryDirectory(prefix="idf_demo_") as folder:
+        target = Path(folder) / ("photo" + Path(upload.filename or "").suffix.lower())
+        await run_in_threadpool(save_upload, upload, target, settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024)
+        return location.exif_of(target)
+
+
+@app.get("/demo/sample/{name}", include_in_schema=False)
+def demo_sample(name: str) -> Response:
+    """A drawn sample photo with no GPS in it (demo_samples.py)."""
+    _demo_on()
+    from idf import demo_samples
+
+    data = demo_samples.jpeg(name)
+    if data is None:
+        raise HTTPException(404, f"No sample called {name!r}")
+    return Response(data, media_type="image/jpeg")
+
+
+@app.post("/demo/reset", include_in_schema=False)
+def demo_reset(request: Request) -> dict[str, bool]:
+    """Forget every photo's fingerprint, so a demo can start again. Demo only."""
+    _demo_on()
+    access.require(request)
+    from idf import fingerprints
+
+    fingerprints.index_file().unlink(missing_ok=True)
+    return {"reset": True}
 
 
 @app.get("/api/health")
