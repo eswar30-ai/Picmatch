@@ -93,11 +93,17 @@ def label(e: Evidence) -> str:
 
 
 def evidence_review(check_type: str, package: Package, reads: dict[int, dict[str, Any]],
-                    what: str, same: dict[int, list[int]] | None = None) -> dict[str, Any]:
+                    what: str, same: dict[int, list[int]] | None = None,
+                    reused: dict[int, str] | None = None) -> dict[str, Any]:
     """Does each file show what it was uploaded for? `what` names the claim in
     the details ("its requirement", "the program"). `same` maps an evidence id to
-    the others whose file is identical: one picture is not evidence for two things."""
-    verdicts = [(e, *evidence_status(reads[e.id])) for e in package.evidence if e.id in reads]
+    the others whose file is identical: one picture is not evidence for two things.
+    `reused` maps an evidence id to the other application that already submitted
+    the same photo (fingerprints.py): someone else's photo is not evidence, so it
+    is rejected whatever it shows."""
+    reused = reused or {}
+    verdicts = [(e, *(("rejected", 10) if e.id in reused else evidence_status(reads[e.id])))
+                for e in package.evidence if e.id in reads]
     if not verdicts:
         return _check(check_type, "changes_required", 0, "no evidence file was read")
     shown = [e for e, s, _ in verdicts if s == "approved"]
@@ -106,6 +112,9 @@ def evidence_review(check_type: str, package: Package, reads: dict[int, dict[str
     parts = [f"{len(shown)} of {len(verdicts)} files show {what}"
              + (f" ({', '.join(label(e) for e in shown)})" if shown else "")]
     for e, read in contradicted:
+        if e.id in reused:
+            parts.append(f"{label(e)} is a photo already submitted by {reused[e.id]}")
+            continue
         parts.append(f"{label(e)} does not: {read.get('reason') or 'the model saw something else'}")
     for e, read in unsure:
         parts.append(f"{label(e)} cannot be told: {read.get('reason') or 'no clear answer'}")
@@ -301,16 +310,18 @@ def overall(checks: list[dict[str, Any]]) -> dict[str, Any]:
 
 def certification_checks(package: Package, reads: dict[int, dict[str, Any]],
                          findings: dict[int, dict[str, Any] | None],
-                         same: dict[int, list[int]] | None = None) -> list[dict[str, Any]]:
-    checks = [evidence_review("evidence_review", package, reads, "their requirement", same),
+                         same: dict[int, list[int]] | None = None,
+                         reused: dict[int, str] | None = None) -> list[dict[str, Any]]:
+    checks = [evidence_review("evidence_review", package, reads, "their requirement", same, reused),
               location_validation(package, findings),
               detail_evidence_match(package, reads)]
     return checks + [overall(checks)]
 
 
 def program_checks(package: Package, reads: dict[int, dict[str, Any]],
-                   same: dict[int, list[int]] | None = None) -> list[dict[str, Any]]:
-    checks = [evidence_review("supporting_materials", package, reads, "the program", same),
+                   same: dict[int, list[int]] | None = None,
+                   reused: dict[int, str] | None = None) -> list[dict[str, Any]]:
+    checks = [evidence_review("supporting_materials", package, reads, "the program", same, reused),
               content_review(package),
               program_details_match(package, reads)]
     return checks + [overall(checks)]

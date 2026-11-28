@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
-from idf import checks, evidence, location
+from idf import checks, evidence, fingerprints, location, settings
 from idf.ocr import ModelDidNotAnswer
 from idf.package import Evidence, Package
 
@@ -74,8 +74,15 @@ def same_files(files: dict[int, Path]) -> dict[int, list[int]]:
     return {eid: [o for o in group if o != eid] for group in by_hash.values() if len(group) > 1 for eid in group}
 
 
+def authenticity_on() -> bool:
+    """The checks of where a photo was taken and whose it is - the institution's
+    own coordinates, fake GPS, a photo another application submitted
+    (AUTHENTICITY_CHECKS, off by default)."""
+    return settings.enabled("AUTHENTICITY_CHECKS")
+
+
 def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
-                 same_as: list[str] | None = None) -> tuple[str, str, int]:
+                 same_as: list[str] | None = None, reused_from: str | None = None) -> tuple[str, str, int]:
     """One file's `ai_status`, `ai_note` and the score behind the status, for
     IDF's evidence record: what the file shows and, for a photo whose position
     is checked, where it was taken, together. The worse of the two decides: the
@@ -100,6 +107,9 @@ def file_verdict(read: dict[str, Any], finding: dict[str, Any] | None,
         status = checks.worst([status, "changes_required"])
         note = f"The same file was also uploaded for {', '.join(same_as)}. {note}"
         score = min(score, 50)
+    if reused_from:
+        status, score = "rejected", min(score, 10)
+        note = f"The same photo was already submitted by {reused_from}. {note}"
     if len(note) > NOTE_MAX:
         note = note[:NOTE_MAX - 3].rstrip() + "..."
     return status, note, score
@@ -132,6 +142,18 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
     if missing:
         raise ValueError(f"no file was received for evidence {', '.join(map(str, missing))}")
     package = kinds_from_files(package, files)
+    # Paused: the photo authenticity checks (taken at the institution's location,
+    # fake GPS, a photo another application already submitted) are commented out
+    # until IDF approves them, so validation runs as it did before. To bring them
+    # back, restore the five lines below and remove the three after them.
+    # authentic = authenticity_on()
+    # site = package.site if authentic else None
+    # reused_records = (fingerprints.reused(package.owner, {e.id: files[e.id] for e in package.photos})
+    #                   if authentic else {})
+    # reused = {eid: fingerprints.describe(record) for eid, record in reused_records.items()}
+    site = None
+    reused_records: dict[int, dict[str, Any]] = {}
+    reused: dict[int, str] = {}
     reads: dict[int, dict[str, Any]] = {}
     findings: dict[int, dict[str, Any] | None] = {}
     # The text of every file is read in order by one worker (CPU), so the next
@@ -162,16 +184,17 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
                       file=sys.stderr, flush=True)
                 traceback.print_exc()
                 reads[item.id] = unreadable(item, exc)
-            findings[item.id] = (location.check(item, location.exif_of(path), peers=package.photos)
+            findings[item.id] = (location.check(item, location.exif_of(path), peers=package.photos,
+                                                site=site, site_source=package.site_source)
                                  if item.kind == "photo" else None)
     finally:
         ahead.shutdown(wait=False, cancel_futures=True)     # a failed audit does not wait for text it will not use
     same = same_files(files)
 
     if package.target_type == "certification":
-        result_checks = checks.certification_checks(package, reads, findings, same)
+        result_checks = checks.certification_checks(package, reads, findings, same, reused)
     else:
-        result_checks = checks.program_checks(package, reads, same)
+        result_checks = checks.program_checks(package, reads, same, reused)
     # IDF gets only approved or rejected: every `changes_required` - checks, files,
     # their locations - is decided by its own score here, after the checks ran.
     comments = comments_for(package, result_checks, reads)
@@ -182,13 +205,15 @@ def run(package: Package, files: dict[int, Path], *, read_photo: Reader = eviden
         read = reads[item.id]
         status, score = checks.evidence_status(read)
         twins = [e for e in package.evidence if e.id in same.get(item.id, [])]
-        ai_status, ai_note, file_score = file_verdict(read, findings.get(item.id), [checks.label(e) for e in twins])
+        ai_status, ai_note, file_score = file_verdict(read, findings.get(item.id), [checks.label(e) for e in twins],
+                                                      reused.get(item.id))
         finding = findings.get(item.id)
         if finding:
             finding = {**finding, "status": checks.decide(finding["status"], finding["score"])}
         items.append({"id": item.id, "title": item.title, "kind": item.kind, "name": item.name,
                       "ai_status": checks.decide(ai_status, file_score), "ai_note": ai_note,
                       "same_file_as": [e.id for e in twins],
+                      "reused_from": reused_records.get(item.id),
                       "status": checks.decide(status, score), "score": score, "shows": read["shows"],
                       "confidence": read["confidence"], "reason": read["reason"],
                       "description": read["description"], "text": read["text"],

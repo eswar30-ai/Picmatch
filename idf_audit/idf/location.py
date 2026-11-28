@@ -13,9 +13,15 @@ EXIF. Its position is then the one the app recorded as it was taken, and what ca
 be checked is that the application's photos were taken in one place.
 
 No geocoding: turning the institution's address into coordinates needs an
-outside service, which this service does not call. Until the
-package carries the institution's own coordinates, "within the premises" is
-not a judgement this check can make, and it says so instead of guessing.
+outside service, which this service does not call. When the package carries
+the institution's own coordinates (`institution.latitude`/`longitude`, a
+program's `venue`) and AUTHENTICITY_CHECKS is on, each photo is also held to
+"taken at the institution": its position - the file's GPS, or for a photo
+taken in their app the app's record of it - within SITE_RADIUS_M of the
+institution. A photo picked from the gallery (`source: upload`) counts only by
+its file's GPS: where the phone was when it was uploaded says nothing about
+where it was taken. A position the phone itself marked fake
+(`mock_location`) is rejected outright.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+from idf import settings
 from idf.package import Evidence
 
 #: Within this of the declared position the file agrees; beyond FAR it contradicts.
@@ -39,6 +46,13 @@ MAX_AGE_DAYS = 90
 ZONE_HOURS = 14
 #: Camera photos of one application further apart than this were not taken at one site.
 SAME_SITE_M = 1000
+#: A photo within this of the institution's marked location was taken there. One
+#: found from the address (geocoded) is only roughly placed - often the
+#: locality's centre - so it gets a wider radius, and is never rejected on it.
+SITE_RADIUS_M = settings.number("SITE_RADIUS_M", 300)
+GEOCODED_RADIUS_M = settings.number("GEOCODED_RADIUS_M", 3000)
+#: A phone less sure of its position than this, in metres, has not placed the photo.
+MAX_ACCURACY_M = settings.number("MAX_GPS_ACCURACY_M", 100)
 
 _GPS_IFD = 0x8825
 _EXIF_IFD = 0x8769
@@ -123,9 +137,52 @@ def _camera(evidence: Evidence, peers: Sequence[Evidence]) -> dict[str, Any]:
                        f"this application (evidence {far.id}), not one site"}
 
 
-def check(evidence: Evidence, exif: dict[str, Any], peers: Sequence[Evidence] = ()) -> dict[str, Any] | None:
+def against_site(evidence: Evidence, exif: dict[str, Any], site: tuple[float, float], source: str = "pin") -> dict[str, Any]:
+    """Was the photo taken at the institution? `status`, `score`, `details` and
+    `distance_m` (None when there was no position to measure)."""
+    if evidence.mock_location:
+        return {"status": "rejected", "score": 5, "distance_m": None,
+                "details": "the phone reported a fake-GPS (mock) position for this photo"}
+    if exif.get("latitude") is not None and exif.get("longitude") is not None:
+        position, whose = (exif["latitude"], exif["longitude"]), "the file's GPS"
+    elif evidence.source == "camera" and evidence.latitude is not None and evidence.longitude is not None:
+        position, whose = (evidence.latitude, evidence.longitude), "the position the app recorded as it was taken"
+    else:
+        why = ("a photo picked from the gallery, without GPS in the file" if evidence.source == "upload"
+               else "no GPS in the file and no position recorded by the app's camera")
+        return {"status": "rejected", "score": 20, "distance_m": None,
+                "details": f"no position for this photo ({why}), so it cannot be shown to have been taken "
+                           f"at the institution"}
+    geocoded = source == "geocoded"
+    radius = GEOCODED_RADIUS_M if geocoded else SITE_RADIUS_M
+    d = distance_m(position[0], position[1], site[0], site[1])
+    where = (f"{whose} is {round(d)} m from the institution's "
+             + ("approximate location (found from its address)" if geocoded else "marked location"))
+    if d <= radius:
+        out = {"status": "approved", "score": 85 if geocoded else 95, "details": f"{where}: within {radius} m"}
+    elif geocoded or d <= 3 * radius:
+        out = {"status": "changes_required", "score": 50,
+               "details": f"{where}: outside the {radius} m around it" + (", which is only approximate" if geocoded else "")}
+    else:
+        out = {"status": "rejected", "score": 10, "details": f"{where}: not taken at the institution"}
+    if evidence.gps_accuracy_m is not None and evidence.gps_accuracy_m > MAX_ACCURACY_M and out["status"] == "approved":
+        out.update(status="changes_required", score=60,
+                   details=f"{out['details']}, but the phone placed itself only to within {round(evidence.gps_accuracy_m)} m")
+    return {**out, "distance_m": round(d)}
+
+
+def _worse(a: str, b: str) -> str:
+    order = ("approved", "changes_required", "rejected")
+    return max(a, b, key=order.index)
+
+
+def check(evidence: Evidence, exif: dict[str, Any], peers: Sequence[Evidence] = (),
+          site: tuple[float, float] | None = None, site_source: str = "") -> dict[str, Any] | None:
     """The finding for one photo, or None when no location is required of it.
     `peers` are the application's other photos, for a camera photo without EXIF.
+    `site`, when given, is the institution's own position (see `against_site`):
+    that judgement leads, and the photos' agreement with each other can only
+    make it worse.
 
     status    approved          the file's GPS is within NEAR_M of the declared position; or a
                                 camera photo without EXIF taken where the application's other
@@ -166,6 +223,14 @@ def check(evidence: Evidence, exif: dict[str, Any], peers: Sequence[Evidence] = 
     else:
         finding.update(status="changes_required", score=30,
                        details="no position in the file and none declared")
+    if site is not None:
+        at = against_site(evidence, exif, site, site_source)
+        finding["site"] = {"position": list(site), "source": site_source, "distance_m": at["distance_m"]}
+        if finding["status"] == "approved":
+            finding.update(status=at["status"], score=at["score"], details=at["details"])
+        else:
+            finding.update(status=_worse(finding["status"], at["status"]), score=min(finding["score"], at["score"]),
+                           details=f"{at['details']}; {finding['details']}")
 
     taken, submitted = parse_time(exif.get("taken_at")), parse_time(evidence.captured_at)
     if taken and submitted:

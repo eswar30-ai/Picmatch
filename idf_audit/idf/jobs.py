@@ -125,10 +125,16 @@ def run_job(job_id: str, folder: Path) -> None:
                 f"{health.get('reason') or 'The vision model is unavailable'} - this audit was not "
                 f"run. Start Ollama with {health.get('model')}, then submit it again.")
         mark(message=f"Judging {len(package.evidence)} evidence file(s)")
-        result = run(package, audit_files(folder))
+        files = audit_files(folder)
+        result = run(package, files)
         result["vlm"] = {"model": health.get("model")}
         target = settings.AUDITS / f"{job_id}.json"
         target.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
+        # Paused with the authenticity checks (audit.py): no photo is remembered for
+        # the reused-photo check until IDF approves it.
+        # if authenticity_on():
+        #     # After the verdict, so an application is never matched against its own photos.
+        #     fingerprints.remember(package.owner, job_id, {e.id: files[e.id] for e in package.photos if e.id in files})
         result["callback"] = callback.post(package.callback_url, callback_body(result))
         target.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
         state = finished_state(result["status"])

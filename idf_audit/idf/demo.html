@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IDF Audit Live Demo</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232b4fd8'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Manrope:wght@600;700;800&display=swap">
+<style>
+/* Layout: the application form on the left, the audit's answer on the right; one column on a phone. */
+:root {
+  --bg: #f3f5f9; --surface: #ffffff; --sunk: #eaeef5; --ink: #18202f; --muted: #586377; --line: #d9dfe9;
+  --accent: #2b4fd8; --accent-ink: #ffffff; --accent-soft: #e4e9fd;
+  --ok: #17784a; --ok-bg: #e2f4ea; --bad: #b8322a; --bad-bg: #fbe7e5; --warn: #9a6400; --warn-bg: #fdf1d8;
+  --display: "Manrope", "Segoe UI", system-ui, sans-serif;
+  --body: "Inter", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #0f131b; --surface: #171c27; --sunk: #1d2331; --ink: #e6eaf2; --muted: #9ba5b8; --line: #2b3243;
+  --accent: #8ca2ff; --accent-ink: #0f131b; --accent-soft: #232c4d;
+  --ok: #55c98e; --ok-bg: #16301f; --bad: #ff8277; --bad-bg: #3a1c1a; --warn: #f0b64a; --warn-bg: #3a2c10;
+  color-scheme: dark } }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--body); }
+.wrap { max-width: 1320px; margin: 0 auto; padding-block: 24px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 20px; }
+h1, h2, h3 { font-family: var(--display); margin: 0; text-wrap: balance; }
+h1 { font-size: clamp(22px, 3vw, 30px); font-weight: 800; letter-spacing: -0.02em; }
+h2 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+p { margin: 0; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+
+.top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px; }
+.top > div { display: grid; gap: 4px; min-width: 0; }
+.status { display: flex; flex-wrap: wrap; gap: 8px; }
+.banner { background: var(--warn-bg); color: var(--warn); border-radius: 10px; padding: 10px 14px; font-size: 14px; }
+
+.layout { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 980px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; display: grid; gap: 16px; min-width: 0; }
+.result-panel { position: sticky; top: max(12px, env(safe-area-inset-top, 0px)); }
+@media (max-width: 980px) { .result-panel { position: static; } }
+
+.scenarios { display: flex; flex-wrap: wrap; gap: 8px; }
+button { font: 600 14px var(--body); border-radius: 9px; cursor: pointer; border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink); padding: 9px 12px; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); padding: 12px 18px; font-size: 15px; }
+button.primary:disabled { opacity: 0.55; cursor: progress; }
+button.chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+button.link { border: 0; background: none; color: var(--accent); padding: 4px 0; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+label.field { display: grid; gap: 4px; font-size: 13px; color: var(--muted); min-width: 0; }
+input, select { font: 15px var(--body); color: var(--ink); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 9px 10px; width: 100%; min-width: 0; }
+input[type="checkbox"] { width: auto; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+
+.photos { display: grid; gap: 14px; }
+.photo { border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 12px; background: var(--bg); }
+.photo-top { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; align-items: start; }
+@media (max-width: 460px) { .photo-top { grid-template-columns: minmax(0, 1fr); } }
+.preview { width: 100%; aspect-ratio: 4 / 3; border-radius: 8px; border: 1px dashed var(--line); background: var(--sunk);
+  object-fit: cover; display: grid; place-items: center; font-size: 12px; color: var(--muted); text-align: center; }
+.photo-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.exif { font-size: 13px; border-radius: 8px; padding: 8px 10px; background: var(--sunk); }
+.exif.ok { background: var(--ok-bg); color: var(--ok); }
+.exif.bad { background: var(--bad-bg); color: var(--bad); }
+
+.pill { display: inline-block; font: 600 11.5px/1 var(--body); letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 5px 8px; border-radius: 999px; white-space: nowrap; background: var(--sunk); color: var(--muted); }
+.pill.ok { background: var(--ok-bg); color: var(--ok); }
+.pill.bad { background: var(--bad-bg); color: var(--bad); }
+.pill.warn { background: var(--warn-bg); color: var(--warn); }
+
+#result { display: grid; gap: 14px; min-width: 0; }
+.empty { display: grid; gap: 8px; place-items: center; text-align: center; padding: 36px 12px; color: var(--muted); }
+.progress { display: grid; gap: 8px; padding: 18px; border-radius: 12px; background: var(--sunk); }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.bar span { display: block; height: 100%; width: 40%; background: var(--accent); border-radius: 3px; animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .bar span { animation: none; width: 100%; opacity: 0.5; } }
+
+.verdict { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 16px; border-radius: 12px; }
+.verdict.ok { background: var(--ok-bg); color: var(--ok); }
+.verdict.bad { background: var(--bad-bg); color: var(--bad); }
+.verdict strong { font: 800 24px/1 var(--display); letter-spacing: 0.02em; }
+.comment { font-size: 14px; background: var(--sunk); border-radius: 8px; padding: 10px 12px; }
+.list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.list li { display: grid; gap: 4px; min-width: 0; }
+.row { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; }
+.row > span:first-child { flex: 1; min-width: 0; }
+.list p { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.file-res { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; }
+.file-res img { width: 72px; height: 54px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }
+details summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 14px; }
+pre { margin: 8px 0 0; max-height: 380px; overflow: auto; background: var(--sunk); border-radius: 8px; padding: 12px; font: 12px/1.5 var(--mono); }
+.history { display: grid; gap: 6px; }
+.history button { display: flex; justify-content: space-between; gap: 8px; text-align: left; font-weight: 500; }
+.error { background: var(--bad-bg); color: var(--bad); border-radius: 10px; padding: 12px 14px; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>IDF Audit Live Demo</h1>
+      <p class="muted small">Fill in an application, add photos, and send it to the audit. The answer is the service's real response.</p>
+    </div>
+    <div class="status" id="status" aria-live="polite"></div>
+  </header>
+  <p class="banner" id="banner" hidden></p>
+
+  <div class="layout">
+    <form class="panel" id="form" novalidate>
+      <section style="display:grid;gap:10px">
+        <h2>Scenario</h2>
+        <div class="scenarios" id="scenarios" role="group" aria-label="Scenario">
+          <button type="button" class="chip" data-s="genuine">Genuine</button>
+          <button type="button" class="chip" data-s="gallery">Downloaded / gallery</button>
+          <button type="button" class="chip" data-s="far">Taken 7 km away</button>
+          <button type="button" class="chip" data-s="mock">Fake GPS</button>
+          <button type="button" class="chip" data-s="reused">Reused photo</button>
+        </div>
+        <p class="muted small" id="scenario-help">A scenario sets how every photo was taken. You can still change each photo below.</p>
+      </section>
+
+      <section style="display:grid;gap:10px">
+        <h2>Institution</h2>
+        <div class="grid2">
+          <label class="field">Name<input id="inst-name" value="Example Fitness Club" autocomplete="off"></label>
+          <label class="field">Type
+            <select id="inst-type">
+              <option>Gym / Fitness Center</option><option>School</option><option>College / University</option>
+              <option>Hospital</option><option>Workplace / Office</option><option>Other</option>
+            </select></label>
+          <label class="field">Latitude<input id="inst-lat" inputmode="decimal" value="17.44350"></label>
+          <label class="field">Longitude<input id="inst-lon" inputmode="decimal" value="78.37720"></label>
+          <label class="field">Location found by
+            <select id="inst-source"><option value="pin">Pin at registration</option><option value="geocoded">Address lookup (approximate)</option></select></label>
+          <label class="field">Application ID<input id="app-id" inputmode="numeric" class="mono"></label>
+        </div>
+        <label class="check"><input type="checkbox" id="keep-id"> Keep this application ID for the next run (the same application, sent again)</label>
+        <label class="field" id="key-field" hidden>API key<input id="api-key" type="password" autocomplete="off"></label>
+      </section>
+
+      <section style="display:grid;gap:10px">
+        <div class="photo-head"><h2>Photos</h2><button type="button" id="add-photo">Add photo</button></div>
+        <div class="photos" id="photos"></div>
+      </section>
+
+      <button type="submit" class="primary" id="run">Run the audit</button>
+      <div class="photo-head">
+        <p class="muted small">Photos are remembered after each run, so a photo sent again by another application is caught.</p>
+        <button type="button" class="link" id="reset">Forget earlier photos</button>
+      </div>
+    </form>
+
+    <section class="panel result-panel" aria-labelledby="h-result">
+      <h2 id="h-result">The audit's answer</h2>
+      <div id="result" aria-live="polite">
+        <div class="empty"><strong>No run yet</strong><span>Pick a scenario, add a photo and press Run the audit.</span></div>
+      </div>
+      <div class="history" id="history" hidden><h2>Earlier runs</h2></div>
+    </section>
+  </div>
+</div>
+
+<template id="photo-tpl">
+  <div class="photo">
+    <div class="photo-head"><strong class="photo-title">Photo</strong><button type="button" class="link remove">Remove</button></div>
+    <div class="photo-top">
+      <img class="preview" alt="" hidden><div class="preview placeholder">No photo yet</div>
+      <div style="display:grid;gap:10px;min-width:0">
+        <label class="field">Photo or PDF<input type="file" class="file" accept="image/*,.pdf"></label>
+        <label class="field">Or a sample photo (no GPS in it)
+          <select class="sample">
+            <option value="">Choose a sample…</option>
+            <option value="badminton-court">Badminton court</option><option value="tennis-court">Tennis court</option>
+            <option value="running-track">Running track</option><option value="activity-poster">Poster: walk 10,000 steps</option>
+            <option value="wellness-poster">Poster: move more, sit less</option><option value="car-park">Car park (wrong picture)</option>
+          </select></label>
+        <label class="field">Uploaded for<input class="req" list="reqs" value="Sports / Fitness Facilities"></label>
+      </div>
+    </div>
+    <div class="grid2">
+      <label class="field">Taken with
+        <select class="source"><option value="camera">In-app camera</option><option value="upload">Picked from the gallery</option></select></label>
+      <label class="field">Phone's position when taken
+        <select class="where"><option value="site">At the institution (25 m)</option><option value="far">7 km away</option><option value="custom">Custom</option><option value="none">Not recorded</option></select></label>
+      <label class="field custom" hidden>Latitude<input class="lat" inputmode="decimal"></label>
+      <label class="field custom" hidden>Longitude<input class="lon" inputmode="decimal"></label>
+      <label class="field">GPS accuracy (m)<input class="acc" inputmode="numeric" value="8"></label>
+      <label class="check" style="align-self:end"><input type="checkbox" class="mock"> Phone reported fake GPS</label>
+    </div>
+    <p class="exif" hidden></p>
+  </div>
+</template>
+<datalist id="reqs">
+  <option>Sports / Fitness Facilities</option><option>Physical Activity Promotion Signage</option><option>Safe Exercise Area</option>
+  <option>Classroom</option><option>Playground / Sports Ground</option><option>PA Policy Document</option><option>Event Records</option>
+</datalist>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const NAMES = { evidence_review: "Photos show the requirement", image_location_validation: "Taken at the institution",
+  detail_evidence_match: "Answers backed by photos", supporting_materials: "Photos show the program",
+  content_review: "Program details", program_details_match: "Program details on photos", overall: "Overall" };
+const SCENARIOS = {
+  genuine: { source: "camera", where: "site", mock: false, help: "Photos taken in the app at the institution. Expect ACCEPTED when the photos show their requirement." },
+  gallery: { source: "upload", where: "none", mock: false, help: "Pictures picked from the gallery, such as an image downloaded from Google. Only GPS inside the file counts." },
+  far: { source: "camera", where: "far", mock: false, help: "The phone was 7 km from the institution when the photos were taken." },
+  mock: { source: "camera", where: "site", mock: true, help: "A fake-GPS app put the phone at the institution. The phone reports it, and the photo is rejected." },
+  reused: { source: "camera", where: "site", mock: false, help: "Taken at the institution, but the photo was already sent by an earlier application. Run Genuine first, then this with the same photo: each run is a new application, so the photo is flagged." },
+};
+const GPS_NOTE = " A photo's own GPS, when the file has one, counts before the phone's position.";
+let config = { authenticity: false, site_radius_m: 300, geocoded_radius_m: 3000, needs_key: false };
+let photoCount = 0;
+const history = [];
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) { if (k === "class") n.className = v; else if (v !== undefined && v !== null) n.setAttribute(k, v); }
+  for (const k of kids.flat()) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+}
+function pill(status) {
+  const cls = status === "approved" || status === "ACCEPTED" ? "ok" : status === "rejected" || status === "REJECTED" || status === "FAILED" ? "bad" : "warn";
+  const word = { approved: "Approved", rejected: "Rejected" }[status] || status;
+  return el("span", { class: `pill ${cls}` }, word);
+}
+function headers() {
+  const key = $("#api-key").value.trim();
+  return key ? { "X-API-Key": key } : {};
+}
+function site() { return [parseFloat($("#inst-lat").value), parseFloat($("#inst-lon").value)]; }
+function north(lat, lon, metres) { return [+(lat + metres / 111195).toFixed(6), lon]; }
+function distance(a, b) {
+  const R = 6371000, r = Math.PI / 180, dp = (b[0] - a[0]) * r, dl = (b[1] - a[1]) * r;
+  const h = Math.sin(dp / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(dl / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const km = m => m >= 1000 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m)} m`;
+function newId() { $("#app-id").value = String(8000 + Math.floor(Math.random() * 1900)); }
+function now() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// --- photos --------------------------------------------------------------------------
+function addPhoto(preset, sample) {
+  photoCount += 1;
+  const node = $("#photo-tpl").content.firstElementChild.cloneNode(true);
+  node.dataset.n = photoCount;
+  $(".photo-title", node).textContent = `Photo ${photoCount}`;
+  if (photoCount === 2) $(".req", node).value = "Physical Activity Promotion Signage";
+  node.querySelectorAll("input, select").forEach(i => { i.id = `p${photoCount}-${i.className.split(" ")[0]}`; });
+  $(".remove", node).addEventListener("click", () => { node.remove(); });
+  $(".where", node).addEventListener("change", () => toggleCustom(node));
+  $(".file", node).addEventListener("change", () => {
+    node._file = $(".file", node).files[0] || null; $(".sample", node).value = ""; onFile(node);
+  });
+  $(".sample", node).addEventListener("change", () => useSample(node, $(".sample", node).value));
+  ["source", "where", "lat", "lon"].forEach(c => $(`.${c}`, node).addEventListener("change", () => describe(node)));
+  $("#photos").append(node);
+  if (preset) applyTo(node, preset);
+  if (sample) { $(".sample", node).value = sample; useSample(node, sample); }
+}
+async function useSample(node, name) {
+  if (!name) return;
+  try {
+    const r = await fetch(`demo/sample/${encodeURIComponent(name)}`);
+    if (!r.ok) throw new Error();
+    node._file = new File([await r.blob()], `${name}.jpg`, { type: "image/jpeg" });
+    $(".file", node).value = "";
+    onFile(node);
+  } catch { showError(`Could not load the sample photo "${name}".`); }
+}
+function toggleCustom(node) {
+  const custom = $(".where", node).value === "custom";
+  node.querySelectorAll(".custom").forEach(f => { f.hidden = !custom; });
+  if (custom && !$(".lat", node).value) { const s = site(); $(".lat", node).value = s[0]; $(".lon", node).value = s[1]; }
+}
+function applyTo(node, s) {
+  $(".source", node).value = s.source; $(".where", node).value = s.where; $(".mock", node).checked = s.mock;
+  toggleCustom(node); describe(node);
+}
+async function onFile(node) {
+  const file = node._file;
+  const img = $("img.preview", node), ph = $(".placeholder", node);
+  node._exif = null;
+  if (!file) { img.hidden = true; ph.hidden = false; describe(node); return; }
+  if (file.type.startsWith("image/")) { img.src = URL.createObjectURL(file); img.hidden = false; ph.hidden = true; }
+  else { img.hidden = true; ph.hidden = false; ph.textContent = file.name; }
+  if (!file.type.startsWith("image/")) { describe(node); return; }
+  const body = new FormData(); body.append("file", file);
+  try {
+    const r = await fetch("demo/exif", { method: "POST", body, headers: headers() });
+    node._exif = r.ok ? await r.json() : null;
+  } catch { node._exif = null; }
+  describe(node);
+}
+function describe(node) {
+  const out = $(".exif", node), file = node._file;
+  if (!file) { out.hidden = true; return; }
+  out.hidden = false; out.className = "exif";
+  if (!file.type.startsWith("image/")) { out.textContent = "A document: read for its text, no location check."; return; }
+  const ex = node._exif, s = site();
+  const parts = [];
+  if (ex && ex.latitude != null) {
+    const d = distance([ex.latitude, ex.longitude], s);
+    parts.push(`GPS in this photo: ${ex.latitude.toFixed(5)}, ${ex.longitude.toFixed(5)} (${km(d)} from the institution)`);
+    out.classList.add(d <= config.site_radius_m ? "ok" : "bad");
+  } else {
+    parts.push("No GPS in this photo file.");
+    if ($(".source", node).value === "upload") { parts.push("Picked from the gallery, so nothing places it at the institution."); out.classList.add("bad"); }
+    else if ($(".where", node).value === "none") { parts.push("And the app recorded no position."); out.classList.add("bad"); }
+    else parts.push("The app's recorded position will be used.");
+  }
+  if (ex && ex.taken_at) parts.push(`Taken ${ex.taken_at}.`);
+  out.textContent = parts.join(" ");
+}
+
+// --- scenarios ------------------------------------------------------------------------
+function chooseScenario(name) {
+  const s = SCENARIOS[name];
+  document.querySelectorAll("#scenarios .chip").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.s === name)));
+  $("#scenario-help").textContent = s.help + GPS_NOTE;
+  document.querySelectorAll(".photo").forEach(n => applyTo(n, s));
+}
+
+// --- the package ----------------------------------------------------------------------
+function buildPackage() {
+  const [lat, lon] = site();
+  if (!isFinite(lat) || !isFinite(lon)) throw new Error("Enter the institution's latitude and longitude.");
+  const appId = parseInt($("#app-id").value, 10);
+  if (!appId) throw new Error("Enter an application ID (a number).");
+  const nodes = [...document.querySelectorAll(".photo")];
+  if (!nodes.length) throw new Error("Add at least one photo.");
+  const files = {}, evidence = [], answers = [];
+  const stamp = now();
+  nodes.forEach((node, i) => {
+    const file = node._file;
+    if (!file) throw new Error(`Choose a file or a sample photo for ${$(".photo-title", node).textContent}.`);
+    const id = i + 1, title = $(".req", node).value.trim() || "Evidence", isPdf = /\.pdf$/i.test(file.name) || file.type === "application/pdf";
+    const where = $(".where", node).value;
+    let pos = [null, null];
+    if (where === "site") pos = north(lat, lon, 25);
+    else if (where === "far") pos = north(lat, lon, 7000);
+    else if (where === "custom") pos = [parseFloat($(".lat", node).value), parseFloat($(".lon", node).value)];
+    files[id] = file;
+    evidence.push({ id, requirement_id: id, requirement_title: title, kind: isPdf ? "document" : "photo", name: file.name,
+      mime_type: isPdf ? "application/pdf" : (file.type || "image/jpeg"), source: $(".source", node).value,
+      latitude: isPdf ? null : pos[0], longitude: isPdf ? null : pos[1],
+      gps_accuracy_m: parseFloat($(".acc", node).value) || null, mock_location: $(".mock", node).checked,
+      captured_at: stamp, requires_gps: !isPdf });
+    answers.push({ question_id: id, section: "Facilities", question: `Is there ${title} at the institution?`,
+      answer_type: "yes_no", answer: "Yes", raw: { bool: 1 } });
+  });
+  const data = {
+    target_type: "certification", application_id: appId, application_no: `DEMO-${appId}`, application_type: "new",
+    institution: { name: $("#inst-name").value.trim() || "Example Institution", category: $("#inst-type").value,
+      full_address: `${$("#inst-name").value.trim()}, demo address`, latitude: lat, longitude: lon,
+      location_source: $("#inst-source").value },
+    questionnaire_answers: answers, evidence_files: evidence, submitted_at: stamp };
+  return { data, files };
+}
+
+// --- running and showing ---------------------------------------------------------------
+async function run(ev) {
+  ev.preventDefault();
+  let built;
+  try { built = buildPackage(); } catch (e) { showError(e.message); return; }
+  const btn = $("#run"); btn.disabled = true; btn.textContent = "Running…";
+  const thumbs = {};
+  document.querySelectorAll(".photo").forEach((n, i) => { const img = $("img.preview", n); if (!img.hidden) thumbs[i + 1] = img.src; });
+  const body = new FormData();
+  body.append("package", JSON.stringify(built.data));
+  for (const [id, file] of Object.entries(built.files)) body.append(`file_${id}`, file, file.name);
+  const started = Date.now();
+  try {
+    const r = await fetch("api/audit", { method: "POST", body, headers: headers() });
+    const sent = await r.json().catch(() => ({}));
+    if (r.status !== 202) throw new Error(sent.detail || `The audit refused it (${r.status}).`);
+    showProgress(sent.audit_id, "Queued", started);
+    if (matchMedia("(max-width: 980px)").matches) $("#h-result").scrollIntoView({ behavior: "smooth", block: "start" });
+    const answer = await poll(sent.audit_id, started);
+    showAnswer(answer, built.data, thumbs);
+    remember(answer, built.data, thumbs);
+    if (!$("#keep-id").checked) newId();
+  } catch (e) { showError(e.message); }
+  finally { btn.disabled = false; btn.textContent = "Run the audit"; refreshStatus(); }
+}
+async function poll(id, started) {
+  for (;;) {
+    const r = await fetch(`api/audit/${encodeURIComponent(id)}`, { headers: headers() });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 409) { showProgress(id, body.message || body.state, started); await new Promise(res => setTimeout(res, 1500)); continue; }
+    if (r.status === 200 || r.status === 422) return { http: r.status, ...body };
+    throw new Error(body.detail || `Could not read the answer (${r.status}).`);
+  }
+}
+let ticker;
+function showProgress(id, message, started) {
+  clearInterval(ticker);
+  const secs = el("span", { class: "mono" }, "0 s");
+  $("#result").replaceChildren(el("div", { class: "progress" },
+    el("strong", {}, message), el("div", { class: "bar" }, el("span")),
+    el("p", { class: "small muted" }, "Audit ", el("span", { class: "mono" }, id), " · ", secs)));
+  ticker = setInterval(() => { secs.textContent = `${Math.round((Date.now() - started) / 1000)} s`; }, 500);
+}
+function showError(message) { clearInterval(ticker); $("#result").replaceChildren(el("p", { class: "error" }, message)); }
+function showAnswer(a, data, thumbs) {
+  clearInterval(ticker);
+  if (a.http === 422) {
+    $("#result").replaceChildren(el("p", { class: "error" }, `The audit could not finish: ${a.message}`)); return;
+  }
+  const ok = a.state === "ACCEPTED";
+  const checks = (a.checks || []).filter(c => c.check_type !== "overall").map(c =>
+    el("li", {}, el("div", { class: "row" }, el("span", {}, NAMES[c.check_type] || c.check_type), el("span", { class: "mono muted" }, c.score), pill(c.status)),
+      el("p", {}, c.details)));
+  const files = (a.evidence || []).map(e => {
+    const loc = e.location || {}, d = loc.site ? loc.site.distance_m : null;
+    const tags = [];
+    if (d != null) tags.push(el("span", { class: `pill ${d <= config.site_radius_m ? "ok" : "bad"}` }, `${km(d)} from the institution`));
+    if (e.reused_from) tags.push(el("span", { class: "pill bad" }, `Already sent by application ${String(e.reused_from.owner).split(":")[1]}`));
+    const media = thumbs[e.id] ? el("img", { src: thumbs[e.id], alt: `Photo ${e.id}` }) : el("div");
+    return el("li", { class: "file-res" }, media,
+      el("div", { style: "display:grid;gap:4px;min-width:0" },
+        el("div", { class: "row" }, el("span", {}, `${e.id}. ${e.title}`), pill(e.ai_status)),
+        tags.length ? el("div", { style: "display:flex;flex-wrap:wrap;gap:6px" }, tags) : "",
+        el("p", {}, e.ai_note)));
+  });
+  const json = el("details", {}, el("summary", {}, "Data sent and received (JSON)"),
+    el("pre", {}, JSON.stringify({ sent: data, answer: a }, (k, v) => k === "text" ? undefined : v, 1)));
+  $("#result").replaceChildren(
+    el("div", { class: `verdict ${ok ? "ok" : "bad"}` }, el("strong", {}, a.state), el("span", { class: "mono" }, `score ${a.score} · ${a.elapsed_seconds} s`)),
+    el("p", { class: "comment" }, a.comments),
+    el("h2", {}, "Checks"), el("ul", { class: "list" }, checks),
+    el("h2", {}, "Each photo"), el("ul", { class: "list" }, files),
+    el("p", { class: "small muted" }, "Audit ", el("span", { class: "mono" }, a.audit_id)), json);
+}
+function remember(a, data, thumbs) {
+  history.unshift({ a, data, thumbs });
+  const box = $("#history"); box.hidden = false;
+  box.replaceChildren(el("h2", {}, "Earlier runs"), ...history.slice(0, 8).map(h =>
+    el("button", { type: "button" }, el("span", {},`${h.data.application_id} · ${h.data.institution.name}`), pill(h.a.state || "FAILED"))));
+  [...box.querySelectorAll("button")].forEach((b, i) => b.addEventListener("click", () => showAnswer(history[i].a, history[i].data, history[i].thumbs)));
+}
+
+async function refreshStatus() {
+  try {
+    const h = await (await fetch("api/health")).json();
+    $("#status").replaceChildren(
+      el("span", { class: `pill ${h.ollama === "up" && h.model_present ? "ok" : "bad"}` }, h.ollama === "up" ? `Model ${h.model}` : "Model down"),
+      el("span", { class: "pill" }, `Queue ${h.queue.QUEUED} · running ${h.queue.PROCESSING}`));
+  } catch { $("#status").replaceChildren(el("span", { class: "pill bad" }, "Service unreachable")); }
+}
+async function init() {
+  try { config = await (await fetch("demo/config")).json(); } catch { /* keep defaults */ }
+  if (!config.authenticity) {
+    const b = $("#banner"); b.hidden = false;
+    b.textContent = "AUTHENTICITY_CHECKS is off on this service, so location and reused-photo checks will not run. Start it with AUTHENTICITY_CHECKS=true.";
+  }
+  $("#key-field").hidden = !config.needs_key;
+  try { $("#api-key").value = sessionStorage.getItem("idf-demo-key") || ""; } catch { /* storage blocked */ }
+  $("#api-key").addEventListener("change", () => { try { sessionStorage.setItem("idf-demo-key", $("#api-key").value); } catch { /* ignore */ } });
+  newId();
+  addPhoto(null, "badminton-court"); addPhoto(null, "activity-poster");
+  chooseScenario("genuine");
+  $("#add-photo").addEventListener("click", () => addPhoto(SCENARIOS[document.querySelector('#scenarios [aria-pressed="true"]')?.dataset.s || "genuine"]));
+  document.querySelectorAll("#scenarios .chip").forEach(b => b.addEventListener("click", () => chooseScenario(b.dataset.s)));
+  ["inst-lat", "inst-lon"].forEach(id => $(`#${id}`).addEventListener("change", () => document.querySelectorAll(".photo").forEach(describe)));
+  $("#reset").addEventListener("click", async () => {
+    const r = await fetch("demo/reset", { method: "POST", headers: headers() });
+    $("#reset").textContent = r.ok ? "Earlier photos forgotten" : "Could not reset";
+    setTimeout(() => { $("#reset").textContent = "Forget earlier photos"; }, 2500);
+  });
+  $("#form").addEventListener("submit", run);
+  refreshStatus();
+}
+init();
+</script>
+</body>
+</html>
